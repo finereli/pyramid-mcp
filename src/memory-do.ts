@@ -54,8 +54,18 @@ export type AddObservationResult =
   | { ok: true; id: string; tagged: string[]; deduped?: boolean }
   | { ok: false; unknown: string[] };
 
+export interface ObservationMatch {
+  id: string;
+  text: string;
+  timestamp: number;
+  score: number; // lower = better (cosine distance blended with time penalty)
+}
+
 const DEDUP_WINDOW_MS = 24 * 3600 * 1000;
 const DEDUP_PREFIX_CHARS = 80;
+
+/** 30-day half-life recency penalty, mirroring Glopus recall.ts. */
+const TIME_DECAY_HALF_LIFE_DAYS = 30;
 
 export class MemoryDO extends DurableObject<Env> {
   private sql: SqlStorage;
@@ -188,7 +198,7 @@ export class MemoryDO extends DurableObject<Env> {
 
     const id = crypto.randomUUID();
     const timestamp = Date.now();
-    const blob = embedding ? floatsToBlob(embedding) : null;
+    const blob = embedding ? floatsToBlob(normalizeVec(embedding)) : null;
     this.sql.exec(
       'INSERT INTO observations (id, text, timestamp, source, embedding) VALUES (?, ?, ?, ?, ?)',
       id, text, timestamp, source, blob,
@@ -203,7 +213,39 @@ export class MemoryDO extends DurableObject<Env> {
   }
 
   setObservationEmbedding(observationId: string, embedding: number[]): void {
-    this.sql.exec('UPDATE observations SET embedding = ? WHERE id = ?', floatsToBlob(embedding), observationId);
+    this.sql.exec('UPDATE observations SET embedding = ? WHERE id = ?', floatsToBlob(normalizeVec(embedding)), observationId);
+  }
+
+  /** Observation ids that still need an embedding (for backfill / seeding). */
+  idsMissingEmbedding(limit = 500): Array<{ id: string; text: string }> {
+    return this.sql
+      .exec('SELECT id, text FROM observations WHERE embedding IS NULL ORDER BY timestamp ASC LIMIT ?', limit)
+      .toArray() as Array<{ id: string; text: string }>;
+  }
+
+  /**
+   * Brute-force cosine search over all embedded observations, blended with a
+   * 30-day-half-life recency penalty (lower score = better). Vectors are stored
+   * pre-normalized, so cosine similarity is a plain dot product. Fine for the
+   * single-DO scale we target; revisit with Vectorize only if it gets slow.
+   */
+  searchObservations(query: number[], limit = 20, timeWeight = 0.3): ObservationMatch[] {
+    const q = normalizeVec(query);
+    const now = Date.now();
+    const rows = this.sql
+      .exec('SELECT id, text, timestamp, embedding FROM observations WHERE embedding IS NOT NULL')
+      .toArray() as Array<{ id: string; text: string; timestamp: number; embedding: ArrayBuffer }>;
+
+    const scored: ObservationMatch[] = rows.map(r => {
+      const v = blobToFloats(r.embedding);
+      const sim = dot(q, v); // both unit-length → cosine similarity
+      const distance = 1 - sim;
+      const timePenalty = computeTimePenalty(r.timestamp, now);
+      const score = distance * (1 - timeWeight) + timePenalty * timeWeight;
+      return { id: r.id, text: r.text, timestamp: r.timestamp, score };
+    });
+    scored.sort((a, b) => a.score - b.score);
+    return scored.slice(0, limit);
   }
 
   /** Prefix-match dedup against observations from the last 24h. */
@@ -283,6 +325,30 @@ function toObservationRow(r: Record<string, unknown>): ObservationRow {
     timestamp: r.timestamp as number,
     source: r.source as string,
   };
+}
+
+/** L2-normalize a vector so cosine similarity reduces to a dot product. */
+export function normalizeVec(v: number[]): number[] {
+  let s = 0;
+  for (const x of v) s += x * x;
+  const n = Math.sqrt(s);
+  if (n === 0) return v.slice();
+  return v.map(x => x / n);
+}
+
+function dot(a: number[], b: Float32Array): number {
+  let s = 0;
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) s += a[i]! * b[i]!;
+  return s;
+}
+
+/** 0 (just now) → 1 (ancient). 30-day half-life. Null timestamp → 0.5. */
+function computeTimePenalty(timestampMs: number | null, now: number): number {
+  if (timestampMs === null) return 0.5;
+  const ageDays = (now - timestampMs) / 86_400_000;
+  const decayRate = Math.log(2) / TIME_DECAY_HALF_LIFE_DAYS;
+  return 1 - Math.exp(-ageDays * decayRate);
 }
 
 /** Float vector → bytes for BLOB storage. */
