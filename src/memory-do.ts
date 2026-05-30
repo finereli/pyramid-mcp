@@ -13,6 +13,8 @@
  */
 import { DurableObject } from 'cloudflare:workers';
 import { handleMcpRequest } from './mcp.js';
+import { synthesize } from './synth.js';
+import { bucketObservations, buildSynthJob } from './pyramid.js';
 
 export interface Env {
   MEMORY_DO: DurableObjectNamespace<MemoryDO>;
@@ -97,12 +99,13 @@ export class MemoryDO extends DurableObject<Env> {
   private migrate(): void {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS models (
-        id          TEXT PRIMARY KEY,
-        name        TEXT UNIQUE NOT NULL,
-        description TEXT,
-        is_seed     INTEGER NOT NULL DEFAULT 0,
-        archived    INTEGER NOT NULL DEFAULT 0,
-        created_at  INTEGER NOT NULL
+        id                    TEXT PRIMARY KEY,
+        name                  TEXT UNIQUE NOT NULL,
+        description           TEXT,
+        is_seed               INTEGER NOT NULL DEFAULT 0,
+        archived              INTEGER NOT NULL DEFAULT 0,
+        created_at            INTEGER NOT NULL,
+        last_summarized_count INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS observations (
         id         TEXT PRIMARY KEY,
@@ -130,6 +133,8 @@ export class MemoryDO extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS idx_sum_model ON summaries(model_id);
     `);
+    // Add columns introduced after the initial schema, for DOs created earlier.
+    try { this.sql.exec('ALTER TABLE models ADD COLUMN last_summarized_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already present */ }
   }
 
   private ensureSeedModels(): void {
@@ -326,6 +331,74 @@ export class MemoryDO extends DurableObject<Env> {
       endTimestamp: r.end_timestamp as number,
       sourceCount: r.source_count as number,
     }));
+  }
+
+  private getModelById(id: string): ModelRow | undefined {
+    const row = this.sql
+      .exec('SELECT id, name, description, is_seed, archived, created_at FROM models WHERE id = ?', id)
+      .toArray()[0] as Record<string, unknown> | undefined;
+    return row ? toModelRow(row) : undefined;
+  }
+
+  /**
+   * Rebuild a model's tiered summaries from its observations (focus-aware
+   * synthesis, older tiers compress harder). Replaces the model's summaries in
+   * place. Returns the number of tiers written.
+   */
+  async rebuildModelSummaries(modelId: string, apiKey: string, now: number = Date.now()): Promise<number> {
+    const model = this.getModelById(modelId);
+    if (!model) return 0;
+    const obs = this.listObservationsForModel(modelId, 5000);
+    const buckets = bucketObservations(obs, now);
+    const jobs = buckets.map(b => buildSynthJob(model, b));
+    const texts = await Promise.all(jobs.map(j => synthesize(j.system, j.user, apiKey, { maxTokens: j.maxTokens })));
+
+    this.sql.exec('DELETE FROM summaries WHERE model_id = ?', modelId);
+    jobs.forEach((j, i) => {
+      this.sql.exec(
+        'INSERT INTO summaries (id, model_id, tier, text, start_timestamp, end_timestamp, source_count, is_dirty) VALUES (?, ?, ?, ?, ?, ?, ?, 0)',
+        crypto.randomUUID(), modelId, j.tier, texts[i], j.startTs, j.endTs, j.sourceCount,
+      );
+    });
+    this.sql.exec('UPDATE models SET last_summarized_count = ? WHERE id = ?', obs.length, modelId);
+    return jobs.length;
+  }
+
+  /** Rebuild summaries for every active model (concurrency-bounded). */
+  async rebuildAllSummaries(apiKey: string): Promise<{ models: number; summaries: number }> {
+    const models = this.listModels();
+    let idx = 0;
+    const pool = Math.min(4, models.length);
+    await Promise.all(Array.from({ length: pool }, async () => {
+      while (idx < models.length) {
+        await this.rebuildModelSummaries(models[idx++]!.id, apiKey);
+      }
+    }));
+    // Count from the DB — accumulating across the concurrent pool would race.
+    const summaries = (this.sql.exec('SELECT COUNT(*) AS c FROM summaries').one() as { c: number }).c;
+    return { models: models.length, summaries };
+  }
+
+  /**
+   * Resummarize trigger (called from record_observation). For each tagged model,
+   * rebuild its pyramid only once it has accumulated `threshold` new observations
+   * since the last build — a no-op in the common case. Failures are swallowed so
+   * recording never fails on synthesis.
+   */
+  async maybeResummarize(modelNames: string[], apiKey: string, threshold = 8): Promise<string[]> {
+    if (!apiKey) return [];
+    const rebuilt: string[] = [];
+    for (const name of modelNames) {
+      const m = this.getModel(name);
+      if (!m) continue;
+      const last = (this.sql.exec('SELECT last_summarized_count AS c FROM models WHERE id = ?', m.id).one() as { c: number }).c;
+      const obsCount = this.getModelConfidence(m.id).obsCount;
+      if (obsCount - last >= threshold) {
+        try { await this.rebuildModelSummaries(m.id, apiKey); rebuilt.push(name); }
+        catch (e) { console.error(`[resummarize] ${name} failed:`, e); }
+      }
+    }
+    return rebuilt;
   }
 
   /** Recency-first across all models — the short-term continuity substitute. */

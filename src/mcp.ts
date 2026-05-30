@@ -84,6 +84,8 @@ const TOOLS: ToolDef[] = [
         return `Unknown model name(s): ${res.unknown.join(', ')}. Call create_model first, or pick existing names from the model index.`;
       }
       if (res.deduped) return 'Skipped as duplicate of a recent observation.';
+      // Resummarize trigger — no-op unless a tagged model crossed its threshold.
+      if (apiKey) { try { await memory.maybeResummarize(res.tagged, apiKey); } catch { /* never fail recording on synthesis */ } }
       return `Recorded against: ${res.tagged.join(', ')}.`;
     },
   },

@@ -69,7 +69,8 @@ export function formatModelView(
   const parts: string[] = [];
   parts.push(`## ${model.name} — ${model.description ?? ''}`.trimEnd());
   parts.push(formatConfidenceMeta(model.name, conf, now));
-  for (const s of summaries) {
+  // Oldest arc first (highest tier) → newest, then recent verbatim notes.
+  for (const s of [...summaries].sort((a, b) => b.tier - a.tier)) {
     parts.push(`\n[tier ${s.tier} · ${s.sourceCount} obs · ${isoDate(s.startTimestamp)}–${isoDate(s.endTimestamp)}]\n${s.text}`);
   }
   if (recentObs.length > 0) {

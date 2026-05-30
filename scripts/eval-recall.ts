@@ -84,13 +84,18 @@ async function post(body: object): Promise<any> {
   return res.json();
 }
 
-function truncate(s: string, n = 1400): string {
+function truncate(s: string, n = 4000): string {
   return s.length > n ? s.slice(0, n) + `\n… (+${s.length - n} chars)` : s;
 }
 
 async function main() {
   if (!existsSync(SEED)) throw new Error(`${SEED} missing`);
   await loadSeed();
+
+  // Build the pyramid so integrative recall (model views) carries the arcs.
+  console.log('building pyramid summaries…');
+  const rb = await fetch(`${BASE}/rebuild`, { method: 'POST', headers: { 'x-user-id': USER, 'x-openai-key': KEY } });
+  console.log('  ' + JSON.stringify(await rb.json()));
 
   const report: string[] = [`# pyramid-mcp recall eval\n\nSeed: 16 models, 1,727 observations (Glopus k111 carve). User: \`${USER}\`.\n`];
   let pass = 0, fail = 0;

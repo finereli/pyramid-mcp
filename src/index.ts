@@ -29,6 +29,17 @@ export default {
       return Response.json(res);
     }
 
+    // Dev-only: rebuild all pyramid summaries for a user (used after seeding,
+    // since bulkLoad doesn't trigger resummarize). Needs the embedding/synthesis key.
+    if (url.pathname === '/rebuild' && request.method === 'POST') {
+      const userId = request.headers.get('x-user-id');
+      const apiKey = request.headers.get('x-openai-key');
+      if (!userId || !apiKey) return new Response('Missing x-user-id or x-openai-key', { status: 401 });
+      const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
+      const res = await stub.rebuildAllSummaries(apiKey);
+      return Response.json(res);
+    }
+
     if (url.pathname === '/mcp') {
       // Dev auth — replaced by OAuth principal resolution in Task #8.
       const userId = request.headers.get('x-user-id');
