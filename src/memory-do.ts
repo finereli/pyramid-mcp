@@ -12,6 +12,7 @@
  * later tasks.
  */
 import { DurableObject } from 'cloudflare:workers';
+import { handleMcpRequest } from './mcp.js';
 
 export interface Env {
   MEMORY_DO: DurableObjectNamespace<MemoryDO>;
@@ -75,6 +76,11 @@ export class MemoryDO extends DurableObject<Env> {
     this.sql = ctx.storage.sql;
     this.migrate();
     this.ensureSeedModels();
+  }
+
+  /** MCP JSON-RPC endpoint — the server is hosted in this DO (see mcp.ts). */
+  override fetch(request: Request): Promise<Response> {
+    return handleMcpRequest(this, request);
   }
 
   // ---------- Schema ----------

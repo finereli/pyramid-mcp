@@ -22,7 +22,8 @@ The trade: continuity is coarser and curated rather than verbatim and complete. 
 
 ## Architecture
 
-- **One Durable Object per authenticated principal** (`MemoryDO`), keyed by Google OAuth `sub`. Holds *everything* for that user in DO-SQLite — models, observations, observation_tags, summaries, and embeddings as blobs. One DO = one person's memory; DOs serialize access, so no cross-conversation locking concerns.
+- **One Durable Object per authenticated principal** (`MemoryDO`), keyed by Google OAuth `sub`. A SQLite-backed DO is a full private *database*, so it holds *everything* for that user — models, observations, observation_tags, summaries, embedding blobs, and (if ever needed) config/session tables. One DO = one person's memory; DOs serialize access, so no cross-conversation locking concerns.
+- **The MCP endpoint is hosted inside that same DO.** The Worker routes `POST /mcp` to the user's DO by principal; the DO answers MCP JSON-RPC directly. No `McpAgent`, no separate per-session DO — that helper is keyed per-session, the wrong shape for per-user memory. Because we don't track conversations (memory is global per user), the server runs **stateless**: each call routes by token, no session state required in v1. Any session/continuity state a host needs later is just another table in the same DB.
 - **Vectors live in the DO — brute-force cosine in JS, no abstraction layer.** Embeddings stored as blobs; search is a plain cosine scan inside the DO. Keeps 100% of a user's data in one object (the self-host / data-control story) and is instant on the MVP seed. Comfortable to tens of thousands of vectors/user. If speed becomes an issue at scale we'll move to Vectorize *then*, not now — no premature interface. Keep the code clean.
 - **No cron.** The two background jobs Glopus ran on a server lifecycle (resummarize, maintenance reorg) are folded into the `record_observation` tool call:
   - resummarize trigger — a no-op unless enough new observations have accumulated; cheap, so it doesn't slow the common case.
@@ -76,4 +77,4 @@ This stays curated because observations are **agent-authored** (voice + synthesi
 
 ## Stack
 
-Cloudflare Workers + Durable Objects (SQLite), `agents` `McpAgent`, `@modelcontextprotocol/sdk`, `@cloudflare/workers-oauth-provider`, `zod`. Tests via `vitest`.
+Cloudflare Workers + Durable Objects (SQLite). MCP JSON-RPC (Streamable HTTP, stateless) hosted directly in the per-user DO — no `McpAgent`. `@cloudflare/workers-oauth-provider` for Google OAuth, `zod` for arg validation. Tests via `vitest` on the workerd runtime (`@cloudflare/vitest-pool-workers`).

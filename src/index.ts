@@ -1,9 +1,10 @@
 /**
  * pyramid-mcp — Worker entrypoint.
  *
- * The MCP transport (McpAgent) + Google OAuth land in later tasks (#4, #8).
- * For now we export the MemoryDO so the storage layer (Task #2) is deployable
- * and testable. See SPEC.md for the full design.
+ * Routes `POST /mcp` to the authenticated user's MemoryDO, which hosts the MCP
+ * JSON-RPC server directly (see mcp.ts). Auth is a dev stub for now — an
+ * `x-user-id` header keys the DO and `x-openai-key` carries the embedding key.
+ * Google OAuth (Task #8) swaps in here without touching the DO or tools.
  */
 import { MemoryDO } from './memory-do.js';
 
@@ -14,9 +15,19 @@ export interface Env {
 }
 
 export default {
-  async fetch(_request: Request, _env: Env): Promise<Response> {
-    return new Response('pyramid-mcp: storage layer only — MCP transport not wired yet (see SPEC.md)', {
-      status: 501,
-    });
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === '/mcp') {
+      // Dev auth — replaced by OAuth principal resolution in Task #8.
+      const userId = request.headers.get('x-user-id');
+      if (!userId) {
+        return new Response('Missing x-user-id (dev auth — OAuth lands in Task #8)', { status: 401 });
+      }
+      const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
+      return stub.fetch(request);
+    }
+
+    return new Response('pyramid-mcp — MCP server at POST /mcp. See SPEC.md.', { status: 200 });
   },
 };
