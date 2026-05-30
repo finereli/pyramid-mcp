@@ -39,7 +39,7 @@ describe('MCP transport over /mcp', () => {
     expect(json.result.protocolVersion).toBe('2025-06-18');
     expect(json.result.instructions).toContain('long-term memory');
     expect(json.result.instructions).toContain('record_observation');
-    expect(json.result.instructions).toContain('WORK for it'); // effortful-recall reinforcement nudge
+    expect(json.result.instructions).toContain('active recollection'); // effortful-recall reinforcement nudge
   });
 
   it('notifications/initialized is a 202 with no body', async () => {
