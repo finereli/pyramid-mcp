@@ -10,6 +10,12 @@
  */
 import type { MemoryDO } from './memory-do.js';
 import { embedText } from './embeddings.js';
+import { formatRecall, formatRecentNotes, formatModelView, formatReceipts, formatModelIndex } from './format.js';
+
+const RECALL_LIMIT = 15;
+const RECENT_NOTES_COUNT = 30;
+const MODEL_VIEW_OBS = 15;
+const RAG_PER_TOPIC = 6;
 
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 const SERVER_INFO = { name: 'pyramid-mcp', version: '0.0.1' };
@@ -119,6 +125,83 @@ const TOOLS: ToolDef[] = [
       if (!name || !description) return 'Both name and description are required.';
       const ok = memory.updateModelDescription(name, description);
       return ok ? `Updated description for "${name}".` : `No model named "${name}". Call create_model if you intended to create it.`;
+    },
+  },
+  {
+    name: 'recall',
+    description:
+      'Search memory for specific facts, details, or context. Use this to verify names, dates, numbers, client details, or any specific information before stating it as fact. Returns raw matching observations (most relevant first), recency-weighted — synthesize them yourself rather than echoing them verbatim.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'What you want to recall — a question or topic. Be specific.' },
+      },
+      required: ['query'],
+    },
+    handler: async (memory, apiKey, args) => {
+      const query = String(args.query ?? '').trim();
+      if (!query) return 'Provide a query.';
+      if (!apiKey) return 'Recall is unavailable: no embedding key is configured for this user.';
+      const qv = await embedText(query, apiKey);
+      return formatRecall(memory.searchObservations(qv, RECALL_LIMIT, 0.3));
+    },
+  },
+  {
+    name: 'load_memory',
+    description:
+      'Load relevant memory at the start of a conversation (or whenever the topic shifts). Pass the topics, people, projects, or questions in play — short tags, not the whole user message. Returns the model index (so you can pull more), recency-first recent notes (continuity), the full view of any topic that matches a model, and specific receipts retrieved for free-text topics. Call this early.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        topics: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Topics/people/projects/questions relevant now. Names matching the model index load that model\'s view; free-text topics drive receipt retrieval.',
+        },
+      },
+      required: ['topics'],
+    },
+    handler: async (memory, apiKey, args) => {
+      const topics = Array.isArray(args.topics) ? args.topics.map(String).map(s => s.trim()).filter(Boolean) : [];
+      const models = memory.listModels();
+      const byName = new Map(models.map(m => [m.name, m]));
+
+      const blocks: string[] = [formatModelIndex(models)];
+
+      const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT));
+      if (recent) blocks.push(`# Recent notes\n_Newest first — continuity across recent conversations._\n\n${recent}`);
+
+      const ragTopics: string[] = [];
+      const views: string[] = [];
+      for (const t of topics) {
+        const model = byName.get(t);
+        if (model) {
+          const conf = memory.getModelConfidence(model.id);
+          const summaries = memory.listSummariesForModel(model.id);
+          const obs = memory.listObservationsForModel(model.id, MODEL_VIEW_OBS);
+          views.push(formatModelView(model, conf, summaries, obs));
+        } else {
+          ragTopics.push(t);
+        }
+      }
+      if (views.length > 0) blocks.push(`# Loaded models\n\n${views.join('\n\n')}`);
+
+      // Free-text topics → observation RAG (needs the embedding key).
+      if (apiKey && ragTopics.length > 0) {
+        const seen = new Set<string>();
+        const receipts = [] as ReturnType<MemoryDO['searchObservations']>;
+        for (const q of ragTopics) {
+          const qv = await embedText(q, apiKey);
+          for (const m of memory.searchObservations(qv, RAG_PER_TOPIC, 0.3)) {
+            if (!seen.has(m.id)) { seen.add(m.id); receipts.push(m); }
+          }
+        }
+        receipts.sort((a, b) => a.score - b.score);
+        const block = formatReceipts(receipts.slice(0, 12));
+        if (block) blocks.push(block);
+      }
+
+      return blocks.filter(Boolean).join('\n\n');
     },
   },
 ];

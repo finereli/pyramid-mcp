@@ -51,6 +51,15 @@ export interface ObservationRow {
   source: string;
 }
 
+export interface SummaryRow {
+  id: string;
+  tier: number;
+  text: string;
+  startTimestamp: number;
+  endTimestamp: number;
+  sourceCount: number;
+}
+
 export type AddObservationResult =
   | { ok: true; id: string; tagged: string[]; deduped?: boolean }
   | { ok: false; unknown: string[] };
@@ -275,6 +284,23 @@ export class MemoryDO extends DurableObject<Env> {
       modelId, limit,
     ).toArray() as Array<Record<string, unknown>>;
     return rows.map(toObservationRow);
+  }
+
+  /** Tiered summaries for a model, oldest tier first (populated by Task #6). */
+  listSummariesForModel(modelId: string): SummaryRow[] {
+    const rows = this.sql.exec(
+      `SELECT id, tier, text, start_timestamp, end_timestamp, source_count
+       FROM summaries WHERE model_id = ? ORDER BY tier ASC, start_timestamp ASC`,
+      modelId,
+    ).toArray() as Array<Record<string, unknown>>;
+    return rows.map(r => ({
+      id: r.id as string,
+      tier: r.tier as number,
+      text: r.text as string,
+      startTimestamp: r.start_timestamp as number,
+      endTimestamp: r.end_timestamp as number,
+      sourceCount: r.source_count as number,
+    }));
   }
 
   /** Recency-first across all models — the short-term continuity substitute. */

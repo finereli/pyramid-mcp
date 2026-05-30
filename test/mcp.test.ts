@@ -49,8 +49,8 @@ describe('MCP transport over /mcp', () => {
   it('tools/list advertises the three reactive tools', async () => {
     const res = await rpc(user(), { jsonrpc: '2.0', id: 2, method: 'tools/list' });
     const json = (await res.json()) as RpcResponse;
-    const names = json.result.tools.map((t: any) => t.name).sort();
-    expect(names).toEqual(['create_model', 'record_observation', 'update_model_description']);
+    const names = json.result.tools.map((t: any) => t.name);
+    expect(names).toEqual(expect.arrayContaining(['create_model', 'record_observation', 'update_model_description']));
     const rec = json.result.tools.find((t: any) => t.name === 'record_observation');
     expect(rec.inputSchema.required).toContain('text');
     expect(rec.inputSchema.required).toContain('models');
@@ -75,5 +75,32 @@ describe('MCP transport over /mcp', () => {
     const res = await rpc(user(), { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'does_not_exist', arguments: {} } });
     const json = (await res.json()) as RpcResponse;
     expect(json.error?.code).toBe(-32602);
+  });
+
+  it('tools/list includes recall and load_memory', async () => {
+    const res = await rpc(user(), { jsonrpc: '2.0', id: 7, method: 'tools/list' });
+    const names = ((await res.json()) as RpcResponse).result.tools.map((t: any) => t.name);
+    expect(names).toContain('recall');
+    expect(names).toContain('load_memory');
+  });
+
+  it('recall without an embedding key fails gracefully', async () => {
+    const res = await rpc(user(), { jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'recall', arguments: { query: 'what is the deal size' } } });
+    const text = ((await res.json()) as RpcResponse).result.content[0].text;
+    expect(text).toContain('unavailable');
+  });
+
+  it('load_memory returns the index, recent notes, and a matched model view', async () => {
+    const u = user();
+    await rpc(u, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'create_model', arguments: { name: 'coaching', description: 'coaching practice' } } });
+    await rpc(u, { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Eli ran a strong coaching call with Cristi', models: ['coaching', 'user'] } } });
+
+    const res = await rpc(u, { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'load_memory', arguments: { topics: ['coaching', 'some-free-text-topic'] } } });
+    const text = ((await res.json()) as RpcResponse).result.content[0].text;
+    expect(text).toContain('# Model index');
+    expect(text).toContain('# Recent notes');
+    expect(text).toContain('# Loaded models');
+    expect(text).toContain('## coaching');
+    expect(text).toContain('coaching call with Cristi');
   });
 });
