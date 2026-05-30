@@ -9,3 +9,6 @@ dist/
 seed-data/
 *.db
 *.db-*
+
+# eval output — contains personal memory, never commit
+eval-report.md

@@ -18,6 +18,17 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // Dev-only bulk seed endpoint (used by scripts/eval-recall.ts). Not exposed
+    // in prod — gated behind the same dev x-user-id as /mcp.
+    if (url.pathname === '/seed' && request.method === 'POST') {
+      const userId = request.headers.get('x-user-id');
+      if (!userId) return new Response('Missing x-user-id', { status: 401 });
+      const { models, observations } = (await request.json()) as { models?: any[]; observations?: any[] };
+      const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
+      const res = await stub.bulkLoad(models ?? [], observations ?? []);
+      return Response.json(res);
+    }
+
     if (url.pathname === '/mcp') {
       // Dev auth — replaced by OAuth principal resolution in Task #8.
       const userId = request.headers.get('x-user-id');

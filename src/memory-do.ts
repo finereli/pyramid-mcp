@@ -227,6 +227,31 @@ export class MemoryDO extends DurableObject<Env> {
     return { ok: true, id, tagged: modelNames };
   }
 
+  /**
+   * Bulk import for seeding/migration. Preserves each observation's ORIGINAL
+   * timestamp (unlike addObservation, which stamps now) and skips dedup. Upserts
+   * models, inserts observations with normalized embeddings, and applies tags.
+   */
+  bulkLoad(
+    models: Array<{ name: string; description: string }>,
+    observations: Array<{ text: string; timestamp: number; models: string[]; embedding?: number[] }>,
+  ): { models: number; observations: number; tags: number } {
+    for (const m of models) this.createModel(m.name, m.description);
+    const idByName = new Map(this.listModels(true).map(m => [m.name, m.id]));
+    let oCount = 0, tCount = 0;
+    for (const o of observations) {
+      const id = crypto.randomUUID();
+      const blob = o.embedding ? floatsToBlob(normalizeVec(o.embedding)) : null;
+      this.sql.exec('INSERT INTO observations (id, text, timestamp, source, embedding) VALUES (?, ?, ?, ?, ?)', id, o.text, o.timestamp, 'direct', blob);
+      oCount++;
+      for (const name of o.models) {
+        const mid = idByName.get(name);
+        if (mid) { this.sql.exec('INSERT OR IGNORE INTO observation_tags (observation_id, model_id) VALUES (?, ?)', id, mid); tCount++; }
+      }
+    }
+    return { models: models.length, observations: oCount, tags: tCount };
+  }
+
   setObservationEmbedding(observationId: string, embedding: number[]): void {
     this.sql.exec('UPDATE observations SET embedding = ? WHERE id = ?', floatsToBlob(normalizeVec(embedding)), observationId);
   }
