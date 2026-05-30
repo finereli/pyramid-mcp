@@ -11,7 +11,7 @@
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
 import type { OAuthHelpers } from '@cloudflare/workers-oauth-provider';
 import { MemoryDO } from './memory-do.js';
-import { devHandler } from './dev-handler.js';
+import { devHandler, adminHandler } from './dev-handler.js';
 import { googleAuthHandler, mcpApiHandler } from './oauth.js';
 
 export { MemoryDO };
@@ -23,6 +23,7 @@ export interface Env {
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
   DEV_AUTH?: string;
+  ADMIN_TOKEN?: string;
 }
 
 const oauthProvider = new OAuthProvider({
@@ -39,6 +40,7 @@ const oauthProvider = new OAuthProvider({
 
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Response | Promise<Response> {
+    if (new URL(request.url).pathname.startsWith('/admin/')) return adminHandler(request, env);
     if (env.DEV_AUTH === 'true') return devHandler(request, env);
     return oauthProvider.fetch(request, env, ctx);
   },
