@@ -6,6 +6,11 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
+  // Custom domain — wrangler provisions DNS + cert for this on the finereli.com zone.
+  "routes": [
+    { "pattern": "pyramid.finereli.com", "custom_domain": true }
+  ],
+
   // One Durable Object per authenticated principal. The MCP agent's own SQLite
   // storage IS the per-user memory store (models, observations, tags, summaries,
   // embedding blobs). Keyed by Google OAuth `sub`.
@@ -21,7 +26,7 @@
   // OAuth token/grant store (required by @cloudflare/workers-oauth-provider).
   // Create with: wrangler kv namespace create OAUTH_KV → paste the id here.
   "kv_namespaces": [
-    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_KV_ID" }
+    { "binding": "OAUTH_KV", "id": "e03653aa5a5a405b962874c375879174" }
   ]
 
   // Secrets (set via `wrangler secret put`; never commit):
