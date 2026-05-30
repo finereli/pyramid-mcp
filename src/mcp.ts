@@ -86,7 +86,13 @@ const TOOLS: ToolDef[] = [
       if (res.deduped) return 'Skipped as duplicate of a recent observation.';
       // Resummarize trigger — no-op unless a tagged model crossed its threshold.
       if (apiKey) { try { await memory.maybeResummarize(res.tagged, apiKey); } catch { /* never fail recording on synthesis */ } }
-      return `Recorded against: ${res.tagged.join(', ')}.`;
+      let out = `Recorded against: ${res.tagged.join(', ')}.`;
+      // Defrag hint — nudge the agent to declutter when the index fragments.
+      const frag = memory.computeFragmentation();
+      if (frag.fragmented) {
+        out += `\n\n[memory note: ${frag.underPopulated} sparse models out of ${frag.activeModels} active — consider folding related ones (fold) or archiving stale ones (archive_model).]`;
+      }
+      return out;
     },
   },
   {
@@ -127,6 +133,59 @@ const TOOLS: ToolDef[] = [
       if (!name || !description) return 'Both name and description are required.';
       const ok = memory.updateModelDescription(name, description);
       return ok ? `Updated description for "${name}".` : `No model named "${name}". Call create_model if you intended to create it.`;
+    },
+  },
+  {
+    name: 'archive_model',
+    description:
+      'Archive a stale, empty, or tangent model — drops it from the index and freezes its observations (reversible, no hard delete). Use during reflection when a model has outlived its usefulness. The five seed models (self, user, system, world, memory) are protected and cannot be archived.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Model to archive.' } },
+      required: ['name'],
+    },
+    handler: async (memory, _apiKey, args) => {
+      const r = memory.archiveModel(String(args.name ?? '').trim());
+      return r.ok ? `Archived "${args.name}".` : r.reason!;
+    },
+  },
+  {
+    name: 'rename_model',
+    description:
+      'Rename a model when its name no longer fits its content (observations follow automatically). Seed models are protected. The new name must be free.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        old_name: { type: 'string', description: 'Current model name.' },
+        new_name: { type: 'string', description: 'New name (lowercase, hyphen-separated).' },
+      },
+      required: ['old_name', 'new_name'],
+    },
+    handler: async (memory, _apiKey, args) => {
+      const r = memory.renameModel(String(args.old_name ?? '').trim(), String(args.new_name ?? '').trim());
+      return r.ok ? `Renamed "${args.old_name}" → "${args.new_name}".` : r.reason!;
+    },
+  },
+  {
+    name: 'fold',
+    description:
+      'Fold one model into another: write a synthesis observation (your own summary of what the source held) into the target model, then archive the source. Use to consolidate redundant or sub-scale models. The synthesis is timestamped now and lands in the target\'s recent tier — consolidation is itself a meaningful event. Source seed models are protected.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Model to fold away (will be archived).' },
+        into: { type: 'string', description: 'Target model that absorbs it.' },
+        synthesis: { type: 'string', description: 'Your synthesis of what the source model held — written in your own voice, to be recorded as an observation in the target.' },
+      },
+      required: ['source', 'into', 'synthesis'],
+    },
+    handler: async (memory, apiKey, args) => {
+      const synthesis = String(args.synthesis ?? '').trim();
+      if (!synthesis) return 'Provide a synthesis of what the source model held.';
+      let embedding: number[] | undefined;
+      if (apiKey) { try { embedding = await embedText(synthesis, apiKey); } catch { /* store without vector */ } }
+      const r = memory.foldModel(String(args.source ?? '').trim(), String(args.into ?? '').trim(), synthesis, embedding);
+      return r.ok ? `Folded "${args.source}" into "${args.into}" and archived the source.` : r.reason!;
     },
   },
   {

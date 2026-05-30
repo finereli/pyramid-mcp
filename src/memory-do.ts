@@ -421,6 +421,63 @@ export class MemoryDO extends DurableObject<Env> {
     return { obsCount: row.c, earliest: row.earliest, latest: row.latest };
   }
 
+  // ---------- Maintenance (cron-less; the agent calls these in-conversation) ----------
+
+  /** Archive a model (drops from the index; observations + summaries frozen). Seeds protected. */
+  archiveModel(name: string): { ok: boolean; reason?: string } {
+    if (isProtectedSeed(name)) return { ok: false, reason: `"${name}" is a protected seed model and can't be archived.` };
+    const m = this.getModel(name);
+    if (!m) return { ok: false, reason: `No model named "${name}".` };
+    this.sql.exec('UPDATE models SET archived = 1 WHERE id = ?', m.id);
+    return { ok: true };
+  }
+
+  /** Rename a model (observations follow via model_id). Seeds protected; target must be free. */
+  renameModel(oldName: string, newName: string): { ok: boolean; reason?: string } {
+    if (isProtectedSeed(oldName)) return { ok: false, reason: `"${oldName}" is a protected seed model and can't be renamed.` };
+    const m = this.getModel(oldName);
+    if (!m) return { ok: false, reason: `No model named "${oldName}".` };
+    if (this.getModel(newName)) return { ok: false, reason: `A model named "${newName}" already exists.` };
+    this.sql.exec('UPDATE models SET name = ? WHERE id = ?', newName, m.id);
+    return { ok: true };
+  }
+
+  /**
+   * Fold one model into another: record a synthesis observation (timestamped now,
+   * summarizing the source) tagged to the target, then archive the source. Source
+   * seeds are protected. Reinforcement is intentional — the synthesis lands in the
+   * target's recent tier.
+   */
+  foldModel(source: string, into: string, synthesis: string, embedding?: number[]): { ok: boolean; reason?: string } {
+    if (isProtectedSeed(source)) return { ok: false, reason: `"${source}" is a protected seed model and can't be folded away.` };
+    const s = this.getModel(source);
+    const t = this.getModel(into);
+    if (!s) return { ok: false, reason: `No model named "${source}".` };
+    if (!t) return { ok: false, reason: `No model named "${into}".` };
+    const id = crypto.randomUUID();
+    const blob = embedding ? floatsToBlob(normalizeVec(embedding)) : null;
+    this.sql.exec('INSERT INTO observations (id, text, timestamp, source, embedding) VALUES (?, ?, ?, ?, ?)', id, synthesis, Date.now(), 'fold', blob);
+    this.sql.exec('INSERT OR IGNORE INTO observation_tags (observation_id, model_id) VALUES (?, ?)', id, t.id);
+    this.sql.exec('UPDATE models SET archived = 1 WHERE id = ?', s.id);
+    return { ok: true };
+  }
+
+  /**
+   * Fragmentation signal for the defrag hint. Counts active models and how many
+   * (non-seed) are under-populated. (Centroid-similarity dedup is a later
+   * refinement; this cheap version drives the in-conversation nudge.)
+   */
+  computeFragmentation(): { activeModels: number; underPopulated: number; fragmented: boolean } {
+    const FLOOR = 5;
+    const models = this.listModels();
+    let under = 0;
+    for (const m of models) {
+      if (isProtectedSeed(m.name)) continue;
+      if (this.getModelConfidence(m.id).obsCount < FLOOR) under++;
+    }
+    return { activeModels: models.length, underPopulated: under, fragmented: under >= 6 || models.length > 40 };
+  }
+
   getStats(): { models: number; observations: number; summaries: number; embedded: number } {
     return {
       models: this.sql.exec('SELECT COUNT(*) AS c FROM models WHERE archived = 0').one().c as number,
