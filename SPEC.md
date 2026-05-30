@@ -23,14 +23,11 @@ The trade: continuity is coarser and curated rather than verbatim and complete. 
 ## Architecture
 
 - **One Durable Object per authenticated principal** (`MemoryDO`), keyed by Google OAuth `sub`. Holds *everything* for that user in DO-SQLite — models, observations, observation_tags, summaries, and embeddings as blobs. One DO = one person's memory; DOs serialize access, so no cross-conversation locking concerns.
-- **Vector storage is a swappable `VectorStore` interface — not a hard "no Vectorize".**
-  - *v1 / MVP / self-host:* an **in-DO backend** — embeddings stored as int8-quantized blobs, brute-force cosine in JS. Zero infra, instant on the ~1,742-vector seed, and keeps 100% of a user's data in one object (the open-source / data-control story). Comfortable to **~40k vectors/user** (int8 under the DO's 128MB ceiling); a heavy user on dense recording reaches that in years, not months.
-  - *scale / production:* a **Vectorize backend** behind the same interface — one account-level index, namespace-per-user — scaling to millions with sub-100ms queries. Easy to wire (`wrangler vectorize create`, one binding).
-  - The recall-test gate is backend-agnostic, so we build the in-DO backend first and keep Vectorize a config flip away. The *only* reason in-DO is the default is data locality: Vectorize moves vectors out of the user's DO into a shared account resource, splitting the self-host story. Decision is config, not architecture.
+- **Vectors live in the DO — brute-force cosine in JS, no abstraction layer.** Embeddings stored as blobs; search is a plain cosine scan inside the DO. Keeps 100% of a user's data in one object (the self-host / data-control story) and is instant on the MVP seed. Comfortable to tens of thousands of vectors/user. If speed becomes an issue at scale we'll move to Vectorize *then*, not now — no premature interface. Keep the code clean.
 - **No cron.** The two background jobs Glopus ran on a server lifecycle (resummarize, maintenance reorg) are folded into the `record_observation` tool call:
   - resummarize trigger — a no-op unless enough new observations have accumulated; cheap, so it doesn't slow the common case.
-  - drift check — returns a nudge message to the agent when models look like they need reorg/declutter, instead of an autonomous cron agent.
-- **Single BYOK.** One provider key for both embeddings and Haiku-class synthesis (OpenRouter, or an OpenAI key with a GPT-mini swap). Phase 2 can move synthesis to MCP *sampling* (use the host's own model — see Phasing).
+  - defrag hint — `record_observation` computes a **fragmentation metric** and, when it crosses a tunable threshold, returns a hint telling the agent to declutter (fold near-duplicate models, archive under-populated ones) using the maintenance tools, in-conversation. Candidate metric: count of near-duplicate model centroids (cosine > ~0.85) plus under-populated models (below an obs floor); threshold tuned against the seed. No autonomous cron agent.
+- **Per-user BYOK.** Each user supplies their own provider API key (OpenRouter, or an OpenAI key with a GPT-mini swap) during the OAuth/onboarding flow — stored in their DO and used for that user's embeddings + synthesis, so nothing runs on the operator's key. Phase 2 can move synthesis to MCP *sampling* (use the host's own model — see Phasing).
 
 ## Tenancy & auth
 
@@ -48,19 +45,13 @@ Reactive (in-conversation), ported from Glopus `memory-tools.ts` with descriptio
 - `recall(query)` — raw observations + summaries, similarity + recency weighted, no synthesis. The receipt path.
 - `load_memory(topics_or_questions[])` — **short args, not the full user message.** Returns recency-first recent observations (token-capped) + matched model views + observation RAG. Agent-as-router: the agent picks topics from the model index.
 
-Privileged / phase 2: `archive_model`, `rename_model`, fold (guarded; the five seed models `self/user/system/world/memory` are protected).
+Maintenance (in v1 — the agent is trusted to manage these): `archive_model`, `rename_model`, `fold` (record a synthesis observation into the parent, then archive the child). Guarded only by protecting the five seed models `self/user/system/world/memory` from archive/rename. No separate cron agent — `record_observation` returns a **defrag hint** when the fragmentation metric crosses threshold, and the agent acts on it in-conversation.
 
 ## load_memory & conversation-start loading
 
 The agent **is** the router — it has the user message in its own context and the model index in front of it, so it calls `load_memory` with topics/questions rather than echoing the whole message (token-cheap, coarse-grained, fine over few models).
 
-Open implementation question (Task #7): how to make the host load memory **at conversation start** automatically. Candidates, in order of preference:
-1. MCP `prompts` protocol (a start-of-chat prompt the host runs).
-2. The MCP server `instructions` field (static system-prompt addendum).
-3. Tool description nudging.
-4. Manual injection into the host's system prompt (fallback; always works, least portable).
-
-Document what each major host (Claude, ChatGPT) actually honors.
+The mechanism for loading memory **at conversation start** is the MCP server `instructions` field — the static system-prompt addendum the protocol provides for exactly this. It carries the directive ("at the start of a conversation, call `load_memory` with the relevant topics; record observations as you go") plus the confidence-metadata legend. Fallbacks if a host ignores `instructions`: a start-of-chat `prompts` entry, tool-description nudging, or manual system-prompt injection. Verify what Claude and ChatGPT actually honor.
 
 ## Recording threshold
 
@@ -72,7 +63,7 @@ This stays curated because observations are **agent-authored** (voice + synthesi
 
 ## Seeding & testing (the MVP gate)
 
-- **Seed** a test DO with Glopus's **1,742 direct observations + 80 models** (skip `source='background'`), rebuild embeddings + pyramid.
+- **Seed** a test DO with Glopus's **1,742 direct observations** (skip `source='background'`) tagged to the **~16-model merged carve** from the migration recipe (5 seeds + ~11 topic/relationship — *not* the raw ~70/80 k-means clusters), then rebuild embeddings + pyramid.
 - **Two recall suites**, the go/no-go gate:
   - *Integrative* — `load_memory` by topic → do model views carry the right arcs?
   - *Direct* — `recall` by specific fact → do the receipts (names, dates, numbers) come back?
@@ -80,8 +71,8 @@ This stays curated because observations are **agent-authored** (voice + synthesi
 
 ## Phasing
 
-- **v1:** everything above — reactive tools, recall, per-model pyramid, load_memory, Google OAuth, seed + recall tests.
-- **Phase 2:** MCP *sampling* for synthesis (use the host's chosen model instead of BYOK — try once Claude/ChatGPT hosts support model selection); maintenance/drift reorganization as a richer tool; a **memory viewer** Worker gated by the same OAuth.
+- **v1:** everything above — reactive tools, recall, per-model pyramid, load_memory, maintenance tools (archive/rename/fold) with the defrag hint, per-user BYOK + Google OAuth, seed + recall tests.
+- **Phase 2:** MCP *sampling* for synthesis (use the host's chosen model instead of BYOK — try once Claude/ChatGPT hosts support model selection); a **memory viewer** Worker gated by the same OAuth.
 
 ## Stack
 
