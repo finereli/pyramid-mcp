@@ -1,0 +1,36 @@
+/**
+ * Dev handler — header-based auth for local development and the eval/seed
+ * scripts. Active only when DEV_AUTH=true (set in .dev.vars, never in prod).
+ * Routes by `x-user-id`; the OpenAI key rides `x-openai-key`. Production uses
+ * the OAuth path in oauth.ts instead.
+ */
+import type { Env } from './index.js';
+
+export async function devHandler(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+
+  if (url.pathname === '/seed' && request.method === 'POST') {
+    const userId = request.headers.get('x-user-id');
+    if (!userId) return new Response('Missing x-user-id', { status: 401 });
+    const { models, observations } = (await request.json()) as { models?: any[]; observations?: any[] };
+    const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
+    return Response.json(await stub.bulkLoad(models ?? [], observations ?? []));
+  }
+
+  if (url.pathname === '/rebuild' && request.method === 'POST') {
+    const userId = request.headers.get('x-user-id');
+    const apiKey = request.headers.get('x-openai-key');
+    if (!userId || !apiKey) return new Response('Missing x-user-id or x-openai-key', { status: 401 });
+    const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
+    return Response.json(await stub.rebuildAllSummaries(apiKey));
+  }
+
+  if (url.pathname === '/mcp') {
+    const userId = request.headers.get('x-user-id');
+    if (!userId) return new Response('Missing x-user-id (dev auth)', { status: 401 });
+    const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
+    return stub.fetch(request);
+  }
+
+  return new Response('pyramid-mcp (dev auth) — POST /mcp with x-user-id. See SPEC.md.', { status: 200 });
+}

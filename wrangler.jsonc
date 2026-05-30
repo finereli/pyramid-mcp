@@ -16,9 +16,16 @@
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["MemoryDO"] }
+  ],
+
+  // OAuth token/grant store (required by @cloudflare/workers-oauth-provider).
+  // Create with: wrangler kv namespace create OAUTH_KV → paste the id here.
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_KV_ID" }
   ]
 
-  // Secrets (set via `wrangler secret put` or .dev.vars locally):
-  //   PROVIDER_API_KEY   — single BYOK for embeddings + synthesis (OpenRouter or OpenAI)
-  //   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET — OAuth (added in Task #8)
+  // Secrets (set via `wrangler secret put`; never commit):
+  //   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET — Google OAuth client
+  // Local dev (.dev.vars, gitignored): DEV_AUTH=true + OPENAI_API_KEY
+  // See SETUP.md.
 }

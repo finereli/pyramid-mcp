@@ -335,7 +335,8 @@ export async function handleMcpRequest(memory: MemoryDO, request: Request): Prom
   if (request.method !== 'POST') {
     return new Response('MCP endpoint expects POST', { status: 405 });
   }
-  const apiKey = request.headers.get('x-openai-key') ?? '';
+  // Dev override via header; in prod the key is stored in the DO at OAuth onboarding.
+  const apiKey = request.headers.get('x-openai-key') || memory.getApiKey();
 
   let body: unknown;
   try {

@@ -132,6 +132,7 @@ export class MemoryDO extends DurableObject<Env> {
         is_dirty        INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_sum_model ON summaries(model_id);
+      CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
     `);
     // Add columns introduced after the initial schema, for DOs created earlier.
     try { this.sql.exec('ALTER TABLE models ADD COLUMN last_summarized_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already present */ }
@@ -147,6 +148,17 @@ export class MemoryDO extends DurableObject<Env> {
         crypto.randomUUID(), m.name, m.description, now,
       );
     }
+  }
+
+  // ---------- Per-user config (BYOK key, captured at OAuth onboarding) ----------
+
+  setApiKey(key: string): void {
+    this.sql.exec("INSERT INTO config (key, value) VALUES ('openai_key', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key);
+  }
+
+  getApiKey(): string {
+    const r = this.sql.exec("SELECT value FROM config WHERE key = 'openai_key'").toArray()[0] as { value: string } | undefined;
+    return r?.value ?? '';
   }
 
   // ---------- Models ----------
