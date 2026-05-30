@@ -33,6 +33,8 @@ As the conversation unfolds, call \`record_observation\` for anything you might 
 
 Use \`recall\` to verify specific facts (names, dates, numbers, quotes) before stating them.
 
+When the user asks you to recall something and you have to WORK for it — several \`recall\` passes, reassembling scattered receipts, or surfacing something stale or thin — that effort is itself a signal: this material is live and matters to them. Record a small observation that captures the *signal*, not a replay of what you just synthesized. Good: a staleness or gap flag ("the Avital engagement went dark after March 15; Eli still tracks him"), or a note that the user returned to a topic worth keeping retrievable. Do NOT re-record your read-time synthesis as if it were primary fact — receipts are ground truth, synthesis stays disposable; feeding derived content back in compounds drift. This is how the long tail the user actually cares about gets reinforced over time.
+
 Bracketed metadata like \`[client-cristi · 12 obs · spans 3mo · latest 2026-05-20]\` tells you how much backs a memory and how fresh it is — calibrate your confidence accordingly. Never mention models, clusters, or that memory was "loaded"; weave recollections in as your own knowing.`;
 
 // ---------- Tool definitions ----------
