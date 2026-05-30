@@ -1,0 +1,28 @@
+{
+  "name": "pyramid-mcp",
+  "version": "0.0.1",
+  "description": "Portable agent-authored memory as a remote MCP server on Cloudflare",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "seed": "tsx scripts/seed.ts"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "0.7.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "agents": "0.13.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260530.1",
+    "tsx": "4.22.3",
+    "typescript": "6.0.3",
+    "vitest": "3.2.4",
+    "wrangler": "4.95.0"
+  }
+}

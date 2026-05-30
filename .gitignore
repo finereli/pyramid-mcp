@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.dev.vars.*
+*.log
+.DS_Store
+# local seed data copied from Glopus — never commit user memory
+seed-data/
+*.db
+*.db-*

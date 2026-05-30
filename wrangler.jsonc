@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pyramid-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // One Durable Object per authenticated principal. The MCP agent's own SQLite
+  // storage IS the per-user memory store (models, observations, tags, summaries,
+  // embedding blobs). Keyed by Google OAuth `sub`.
+  "durable_objects": {
+    "bindings": [
+      { "name": "MEMORY_DO", "class_name": "MemoryDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["MemoryDO"] }
+  ]
+
+  // Secrets (set via `wrangler secret put` or .dev.vars locally):
+  //   PROVIDER_API_KEY   — single BYOK for embeddings + synthesis (OpenRouter or OpenAI)
+  //   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET — OAuth (added in Task #8)
+}
