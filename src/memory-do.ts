@@ -1,0 +1,297 @@
+/**
+ * MemoryDO — one Durable Object per authenticated principal.
+ *
+ * Holds *all* of a user's memory in DO-SQLite: models, observations,
+ * observation_tags, summaries, and embedding blobs. DOs serialize access, so
+ * there's no cross-conversation locking to worry about. Vectors are stored
+ * inline as blobs and searched by brute-force cosine in JS (see vector-search,
+ * Task #3) — no external store, so 100% of a user's data lives in this object.
+ *
+ * This module owns the storage layer (schema + CRUD). The MCP transport,
+ * embeddings, recall, summarization, and load_memory build on top of it in
+ * later tasks.
+ */
+import { DurableObject } from 'cloudflare:workers';
+
+export interface Env {
+  MEMORY_DO: DurableObjectNamespace<MemoryDO>;
+}
+
+/** The five seed models, protected from archive/rename. Cold-start scaffold. */
+export const SEED_MODELS: ReadonlyArray<{ name: string; description: string }> = [
+  { name: 'self', description: "The agent's own self-model — its voice, dispositions, and evolving sense of who it is." },
+  { name: 'user', description: 'The human it primarily serves — who they are, what they care about, the central column of memory.' },
+  { name: 'system', description: 'The operating substrate — how the agent works, what it knows about itself as software, its tools and constraints.' },
+  { name: 'world', description: 'Everything else, until it differentiates into specific models. An escape valve, not a destination.' },
+  { name: 'memory', description: 'The meta-model: how memory is organized in this instance — when to fold vs. split, what counts as stale, how this agent carves up its life.' },
+];
+
+export const PROTECTED_SEED_NAMES: ReadonlySet<string> = new Set(SEED_MODELS.map(m => m.name));
+
+export function isProtectedSeed(name: string): boolean {
+  return PROTECTED_SEED_NAMES.has(name);
+}
+
+// ---------- Row shapes ----------
+
+export interface ModelRow {
+  id: string;
+  name: string;
+  description: string | null;
+  isSeed: boolean;
+  archived: boolean;
+  createdAt: number;
+}
+
+export interface ObservationRow {
+  id: string;
+  text: string;
+  timestamp: number;
+  source: string;
+}
+
+export type AddObservationResult =
+  | { ok: true; id: string; tagged: string[]; deduped?: boolean }
+  | { ok: false; unknown: string[] };
+
+const DEDUP_WINDOW_MS = 24 * 3600 * 1000;
+const DEDUP_PREFIX_CHARS = 80;
+
+export class MemoryDO extends DurableObject<Env> {
+  private sql: SqlStorage;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    this.migrate();
+    this.ensureSeedModels();
+  }
+
+  // ---------- Schema ----------
+
+  private migrate(): void {
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS models (
+        id          TEXT PRIMARY KEY,
+        name        TEXT UNIQUE NOT NULL,
+        description TEXT,
+        is_seed     INTEGER NOT NULL DEFAULT 0,
+        archived    INTEGER NOT NULL DEFAULT 0,
+        created_at  INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS observations (
+        id         TEXT PRIMARY KEY,
+        text       TEXT NOT NULL,
+        timestamp  INTEGER NOT NULL,
+        source     TEXT NOT NULL DEFAULT 'direct',
+        embedding  BLOB
+      );
+      CREATE INDEX IF NOT EXISTS idx_obs_ts ON observations(timestamp);
+      CREATE TABLE IF NOT EXISTS observation_tags (
+        observation_id TEXT NOT NULL,
+        model_id       TEXT NOT NULL,
+        PRIMARY KEY (observation_id, model_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_tags_model ON observation_tags(model_id);
+      CREATE TABLE IF NOT EXISTS summaries (
+        id              TEXT PRIMARY KEY,
+        model_id        TEXT NOT NULL,
+        tier            INTEGER NOT NULL,
+        text            TEXT NOT NULL,
+        start_timestamp INTEGER NOT NULL,
+        end_timestamp   INTEGER NOT NULL,
+        source_count    INTEGER NOT NULL DEFAULT 0,
+        is_dirty        INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_sum_model ON summaries(model_id);
+    `);
+  }
+
+  private ensureSeedModels(): void {
+    const count = this.sql.exec('SELECT COUNT(*) AS c FROM models').one().c as number;
+    if (count > 0) return; // already seeded (or migrated) — don't re-create
+    const now = Date.now();
+    for (const m of SEED_MODELS) {
+      this.sql.exec(
+        'INSERT INTO models (id, name, description, is_seed, created_at) VALUES (?, ?, ?, 1, ?)',
+        crypto.randomUUID(), m.name, m.description, now,
+      );
+    }
+  }
+
+  // ---------- Models ----------
+
+  /** Upsert by name. Returns the model id; updates description if it changed. */
+  createModel(name: string, description: string): string {
+    const existing = this.sql
+      .exec('SELECT id, description FROM models WHERE name = ?', name)
+      .toArray()[0] as { id: string; description: string | null } | undefined;
+    if (existing) {
+      if (existing.description !== description) {
+        this.sql.exec('UPDATE models SET description = ? WHERE id = ?', description, existing.id);
+      }
+      return existing.id;
+    }
+    const id = crypto.randomUUID();
+    this.sql.exec(
+      'INSERT INTO models (id, name, description, is_seed, created_at) VALUES (?, ?, ?, 0, ?)',
+      id, name, description, Date.now(),
+    );
+    return id;
+  }
+
+  updateModelDescription(name: string, description: string): boolean {
+    const cursor = this.sql.exec('UPDATE models SET description = ? WHERE name = ?', description, name);
+    return cursor.rowsWritten > 0;
+  }
+
+  listModels(includeArchived = false): ModelRow[] {
+    const rows = this.sql
+      .exec(`SELECT id, name, description, is_seed, archived, created_at FROM models${includeArchived ? '' : ' WHERE archived = 0'} ORDER BY name`)
+      .toArray() as Array<Record<string, unknown>>;
+    return rows.map(toModelRow);
+  }
+
+  getModel(name: string): ModelRow | undefined {
+    const row = this.sql
+      .exec('SELECT id, name, description, is_seed, archived, created_at FROM models WHERE name = ?', name)
+      .toArray()[0] as Record<string, unknown> | undefined;
+    return row ? toModelRow(row) : undefined;
+  }
+
+  // ---------- Observations ----------
+
+  /**
+   * Agent-authored multi-tag observation. Validates every model name exists,
+   * dedups against recent identical-prefix observations, inserts one tag row
+   * per model. Embedding (if provided) is stored inline as a blob; otherwise
+   * the caller embeds asynchronously and calls setObservationEmbedding.
+   */
+  addObservation(
+    text: string,
+    modelNames: string[],
+    source = 'direct',
+    embedding?: number[],
+  ): AddObservationResult {
+    if (modelNames.length === 0) return { ok: false, unknown: [] };
+
+    const found = this.sql
+      .exec(`SELECT id, name FROM models WHERE name IN (${placeholders(modelNames.length)})`, ...modelNames)
+      .toArray() as Array<{ id: string; name: string }>;
+    const idByName = new Map(found.map(m => [m.name, m.id]));
+    const unknown = modelNames.filter(n => !idByName.has(n));
+    if (unknown.length > 0) return { ok: false, unknown };
+
+    if (this.hasSimilarRecentObservation(text)) {
+      return { ok: true, id: '', tagged: [], deduped: true };
+    }
+
+    const id = crypto.randomUUID();
+    const timestamp = Date.now();
+    const blob = embedding ? floatsToBlob(embedding) : null;
+    this.sql.exec(
+      'INSERT INTO observations (id, text, timestamp, source, embedding) VALUES (?, ?, ?, ?, ?)',
+      id, text, timestamp, source, blob,
+    );
+    for (const name of modelNames) {
+      this.sql.exec(
+        'INSERT OR IGNORE INTO observation_tags (observation_id, model_id) VALUES (?, ?)',
+        id, idByName.get(name)!,
+      );
+    }
+    return { ok: true, id, tagged: modelNames };
+  }
+
+  setObservationEmbedding(observationId: string, embedding: number[]): void {
+    this.sql.exec('UPDATE observations SET embedding = ? WHERE id = ?', floatsToBlob(embedding), observationId);
+  }
+
+  /** Prefix-match dedup against observations from the last 24h. */
+  private hasSimilarRecentObservation(text: string): boolean {
+    const cutoff = Date.now() - DEDUP_WINDOW_MS;
+    const prefix = text.substring(0, DEDUP_PREFIX_CHARS).toLowerCase().trim();
+    const recent = this.sql
+      .exec('SELECT text FROM observations WHERE timestamp >= ? ORDER BY timestamp DESC', cutoff)
+      .toArray() as Array<{ text: string }>;
+    return recent.some(o => o.text.substring(0, DEDUP_PREFIX_CHARS).toLowerCase().trim() === prefix);
+  }
+
+  listObservationsForModel(modelId: string, limit = 200): ObservationRow[] {
+    const rows = this.sql.exec(
+      `SELECT o.id, o.text, o.timestamp, o.source
+       FROM observations o
+       JOIN observation_tags t ON t.observation_id = o.id
+       WHERE t.model_id = ?
+       ORDER BY o.timestamp DESC
+       LIMIT ?`,
+      modelId, limit,
+    ).toArray() as Array<Record<string, unknown>>;
+    return rows.map(toObservationRow);
+  }
+
+  /** Recency-first across all models — the short-term continuity substitute. */
+  recentObservations(limit = 30): ObservationRow[] {
+    const rows = this.sql
+      .exec('SELECT id, text, timestamp, source FROM observations ORDER BY timestamp DESC LIMIT ?', limit)
+      .toArray() as Array<Record<string, unknown>>;
+    return rows.map(toObservationRow);
+  }
+
+  // ---------- Confidence / stats ----------
+
+  getModelConfidence(modelId: string): { obsCount: number; earliest: number | null; latest: number | null } {
+    const row = this.sql.exec(
+      `SELECT COUNT(*) AS c, MIN(o.timestamp) AS earliest, MAX(o.timestamp) AS latest
+       FROM observation_tags t JOIN observations o ON o.id = t.observation_id
+       WHERE t.model_id = ?`,
+      modelId,
+    ).one() as { c: number; earliest: number | null; latest: number | null };
+    return { obsCount: row.c, earliest: row.earliest, latest: row.latest };
+  }
+
+  getStats(): { models: number; observations: number; summaries: number; embedded: number } {
+    return {
+      models: this.sql.exec('SELECT COUNT(*) AS c FROM models WHERE archived = 0').one().c as number,
+      observations: this.sql.exec('SELECT COUNT(*) AS c FROM observations').one().c as number,
+      summaries: this.sql.exec('SELECT COUNT(*) AS c FROM summaries').one().c as number,
+      embedded: this.sql.exec('SELECT COUNT(*) AS c FROM observations WHERE embedding IS NOT NULL').one().c as number,
+    };
+  }
+}
+
+// ---------- helpers ----------
+
+function placeholders(n: number): string {
+  return Array.from({ length: n }, () => '?').join(',');
+}
+
+function toModelRow(r: Record<string, unknown>): ModelRow {
+  return {
+    id: r.id as string,
+    name: r.name as string,
+    description: (r.description as string | null) ?? null,
+    isSeed: Boolean(r.is_seed),
+    archived: Boolean(r.archived),
+    createdAt: r.created_at as number,
+  };
+}
+
+function toObservationRow(r: Record<string, unknown>): ObservationRow {
+  return {
+    id: r.id as string,
+    text: r.text as string,
+    timestamp: r.timestamp as number,
+    source: r.source as string,
+  };
+}
+
+/** Float vector → bytes for BLOB storage. */
+export function floatsToBlob(v: number[]): Uint8Array {
+  return new Uint8Array(new Float32Array(v).buffer);
+}
+
+/** BLOB bytes → Float32Array (for cosine search in Task #3). */
+export function blobToFloats(blob: ArrayBuffer | Uint8Array): Float32Array {
+  const buf = blob instanceof Uint8Array ? blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength) : blob;
+  return new Float32Array(buf);
+}
