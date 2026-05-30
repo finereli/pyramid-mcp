@@ -23,7 +23,10 @@ The trade: continuity is coarser and curated rather than verbatim and complete. 
 ## Architecture
 
 - **One Durable Object per authenticated principal** (`MemoryDO`), keyed by Google OAuth `sub`. Holds *everything* for that user in DO-SQLite — models, observations, observation_tags, summaries, and embeddings as blobs. One DO = one person's memory; DOs serialize access, so no cross-conversation locking concerns.
-- **No Vectorize.** Embeddings are stored as blobs and searched by brute-force cosine in JS inside the DO. Fine for a few thousand observations per user, and it keeps 100% of a user's data inside a single object — important for the open-source / "you control your data" goal.
+- **Vector storage is a swappable `VectorStore` interface — not a hard "no Vectorize".**
+  - *v1 / MVP / self-host:* an **in-DO backend** — embeddings stored as int8-quantized blobs, brute-force cosine in JS. Zero infra, instant on the ~1,742-vector seed, and keeps 100% of a user's data in one object (the open-source / data-control story). Comfortable to **~40k vectors/user** (int8 under the DO's 128MB ceiling); a heavy user on dense recording reaches that in years, not months.
+  - *scale / production:* a **Vectorize backend** behind the same interface — one account-level index, namespace-per-user — scaling to millions with sub-100ms queries. Easy to wire (`wrangler vectorize create`, one binding).
+  - The recall-test gate is backend-agnostic, so we build the in-DO backend first and keep Vectorize a config flip away. The *only* reason in-DO is the default is data locality: Vectorize moves vectors out of the user's DO into a shared account resource, splitting the self-host story. Decision is config, not architecture.
 - **No cron.** The two background jobs Glopus ran on a server lifecycle (resummarize, maintenance reorg) are folded into the `record_observation` tool call:
   - resummarize trigger — a no-op unless enough new observations have accumulated; cheap, so it doesn't slow the common case.
   - drift check — returns a nudge message to the agent when models look like they need reorg/declutter, instead of an autonomous cron agent.
