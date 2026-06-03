@@ -62,5 +62,19 @@ export async function adminHandler(request: Request, env: Env): Promise<Response
     return Response.json(await stubFor(userId).rebuildAllSummaries());
   }
 
+  // Read-only — inspect a user's DO (counts + embedding dimension) before a migration.
+  if (url.pathname === '/admin/stats' && request.method === 'POST') {
+    const { userId } = (await request.json()) as { userId?: string };
+    if (!userId) return new Response('userId (body) required', { status: 400 });
+    return Response.json(await stubFor(userId).getStats());
+  }
+
+  // Destructive — wipe a user's memory back to the seed models. Requires confirm:true.
+  if (url.pathname === '/admin/reset' && request.method === 'POST') {
+    const { userId, confirm } = (await request.json()) as { userId?: string; confirm?: boolean };
+    if (!userId || confirm !== true) return new Response('userId + confirm:true (body) required', { status: 400 });
+    return Response.json(await stubFor(userId).resetMemory());
+  }
+
   return new Response('unknown admin route', { status: 404 });
 }

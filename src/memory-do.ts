@@ -487,13 +487,33 @@ export class MemoryDO extends DurableObject<Env> {
     return { activeModels: models.length, underPopulated: under, fragmented: under >= 6 || models.length > 40 };
   }
 
-  getStats(): { models: number; observations: number; summaries: number; embedded: number } {
+  getStats(): { models: number; observations: number; summaries: number; embedded: number; embeddingDim: number } {
+    // Blob byte length / 4 (Float32) = vector dimension. Lets a migration check
+    // distinguish old 1536-dim (OpenAI) data from new 1024-dim (bge-m3).
+    const dimRow = this.sql.exec('SELECT LENGTH(embedding) AS b FROM observations WHERE embedding IS NOT NULL LIMIT 1').toArray()[0] as { b: number } | undefined;
     return {
       models: this.sql.exec('SELECT COUNT(*) AS c FROM models WHERE archived = 0').one().c as number,
       observations: this.sql.exec('SELECT COUNT(*) AS c FROM observations').one().c as number,
       summaries: this.sql.exec('SELECT COUNT(*) AS c FROM summaries').one().c as number,
       embedded: this.sql.exec('SELECT COUNT(*) AS c FROM observations WHERE embedding IS NOT NULL').one().c as number,
+      embeddingDim: dimRow ? dimRow.b / 4 : 0,
     };
+  }
+
+  /**
+   * Wipe ALL of this user's memory and restore the cold-start seed models.
+   * Destructive and irreversible — used by the token-gated /admin/reset for the
+   * embedding-space migration (old 1536-dim data can't be queried by 1024-dim
+   * bge-m3 vectors, so it has to be cleared and re-seeded).
+   */
+  resetMemory(): { cleared: true } {
+    this.sql.exec('DELETE FROM observation_tags');
+    this.sql.exec('DELETE FROM observations');
+    this.sql.exec('DELETE FROM summaries');
+    this.sql.exec('DELETE FROM models');
+    this.sql.exec('DELETE FROM config');
+    this.ensureSeedModels();
+    return { cleared: true };
   }
 }
 
