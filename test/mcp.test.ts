@@ -8,12 +8,11 @@ interface RpcResponse {
   error?: { code: number; message: string };
 }
 
-async function rpc(userId: string, body: object, openaiKey?: string): Promise<Response> {
+async function rpc(userId: string, body: object): Promise<Response> {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     'x-user-id': userId,
   };
-  if (openaiKey) headers['x-openai-key'] = openaiKey;
   return SELF.fetch('https://example.com/mcp', { method: 'POST', headers, body: JSON.stringify(body) });
 }
 
@@ -62,7 +61,8 @@ describe('MCP transport over /mcp', () => {
     const mk = await rpc(u, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'create_model', arguments: { name: 'coaching', description: 'coaching practice' } } });
     expect(((await mk.json()) as RpcResponse).result.content[0].text).toContain('ready');
 
-    // No OpenAI key in test → stored without embedding, still recorded.
+    // Embedding rides env.AI; if it's unavailable the obs is stored without a
+    // vector. Either way the record succeeds.
     const rec = await rpc(u, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Eli closed Cristi at $4k/mo', models: ['user', 'coaching'] } } });
     const recText = ((await rec.json()) as RpcResponse).result.content[0].text;
     expect(recText).toContain('Recorded against');
@@ -85,10 +85,15 @@ describe('MCP transport over /mcp', () => {
     expect(names).toContain('load_memory');
   });
 
-  it('recall without an embedding key fails gracefully', async () => {
+  it('recall returns a well-formed result (no BYOK key required)', async () => {
+    // Embedding rides env.AI now — no per-user key gate. Whether the binding is
+    // reachable in the test env or not, recall must return a valid content
+    // payload (real hits, an empty-result message, or a graceful embed-error),
+    // never the old "no key configured" rejection.
     const res = await rpc(user(), { jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'recall', arguments: { query: 'what is the deal size' } } });
     const text = ((await res.json()) as RpcResponse).result.content[0].text;
-    expect(text).toContain('unavailable');
+    expect(typeof text).toBe('string');
+    expect(text).not.toContain('no embedding key');
   });
 
   it('load_memory returns the index, recent notes, and a matched model view', async () => {

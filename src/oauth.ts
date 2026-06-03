@@ -3,16 +3,16 @@
  * @cloudflare/workers-oauth-provider. Two handlers wired in index.ts:
  *
  *   - googleAuthHandler (defaultHandler): the authorization UI. /authorize
- *     redirects to Google; /callback exchanges the code, then shows a one-field
- *     page to capture the user's OpenAI key (per-user BYOK); /finish stores the
- *     key in the user's MemoryDO and completes the OAuth grant.
+ *     redirects to Google; /callback exchanges the code and completes the OAuth
+ *     grant. No BYOK step — embedding + synthesis run on Workers AI (env.AI),
+ *     billed to the account, so memory works the moment a user signs in.
  *   - mcpApiHandler (apiHandler): token-protected /mcp. The authenticated
- *     principal (Google `sub`, in ctx.props.userId) keys the MemoryDO; the DO
- *     reads its own stored OpenAI key. No headers.
+ *     principal (Google `sub`, in ctx.props.userId) keys the MemoryDO. No headers.
  *
  * UNTESTED until deployed with real Google credentials — see SETUP.md.
  */
 import type { Env } from './index.js';
+import { landingResponse } from './landing.js';
 
 const GOOGLE_AUTH = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN = 'https://oauth2.googleapis.com/token';
@@ -21,16 +21,17 @@ const GOOGLE_USERINFO = 'https://openidconnect.googleapis.com/v1/userinfo';
 const b64urlEncode = (o: unknown) => btoa(JSON.stringify(o)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const b64urlDecode = (s: string) => JSON.parse(atob(s.replace(/-/g, '+').replace(/_/g, '/')));
 
-function html(body: string): Response {
-  return new Response(`<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><style>body{font:16px/1.5 system-ui;max-width:34rem;margin:4rem auto;padding:0 1rem}input{font:inherit;width:100%;padding:.6rem;margin:.4rem 0;box-sizing:border-box}button{font:inherit;padding:.6rem 1.2rem;cursor:pointer}</style>${body}`, { headers: { 'content-type': 'text/html' } });
-}
-
 // ---------- defaultHandler: Google auth UI ----------
 
 export const googleAuthHandler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const origin = url.origin;
+
+    // 0. Browser hitting the root → the human-facing landing page.
+    if (url.pathname === '/' && (request.method === 'GET' || request.method === 'HEAD')) {
+      return landingResponse();
+    }
 
     // 1. MCP client begins auth → stash the parsed OAuth request in Google's state.
     if (url.pathname === '/authorize') {
@@ -45,7 +46,7 @@ export const googleAuthHandler = {
       return Response.redirect(g.toString(), 302);
     }
 
-    // 2. Google redirects back → exchange code, then ask for the OpenAI key.
+    // 2. Google redirects back → exchange code, then complete the OAuth grant.
     if (url.pathname === '/callback') {
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
@@ -69,24 +70,10 @@ export const googleAuthHandler = {
       if (!infoRes.ok) return new Response('Google userinfo failed', { status: 502 });
       const { sub, email } = (await infoRes.json()) as { sub: string; email: string };
 
-      // Carry the principal + original OAuth request into the key-capture form.
-      const carry = b64urlEncode({ oauthReq: b64urlDecode(state), sub, email });
-      return html(`<h2>Connect your memory</h2><p>Signed in as <b>${email}</b>. Paste your OpenAI API key — it's stored only in your own memory object and used for your embeddings + synthesis.</p>
-<form method="POST" action="/finish"><input type="password" name="openai_key" placeholder="sk-..." autocomplete="off" required><input type="hidden" name="carry" value="${carry}"><button type="submit">Finish</button></form>`);
-    }
-
-    // 3. Store the key in the user's DO, then complete the OAuth grant.
-    if (url.pathname === '/finish' && request.method === 'POST') {
-      const form = await request.formData();
-      const openaiKey = String(form.get('openai_key') ?? '').trim();
-      const { oauthReq, sub, email } = b64urlDecode(String(form.get('carry') ?? ''));
-      if (!openaiKey || !sub) return new Response('Missing key or session', { status: 400 });
-
-      const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(sub));
-      await stub.setApiKey(openaiKey);
-
+      // No BYOK step — Workers AI (env.AI) handles embedding + synthesis, so we
+      // complete the grant straight away.
       const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-        request: oauthReq,
+        request: b64urlDecode(state),
         userId: sub,
         scope: ['memory'],
         metadata: { email },

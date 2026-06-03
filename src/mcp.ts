@@ -5,11 +5,10 @@
  * state to keep (memory is global per user).
  *
  * Tools are thin wrappers over the DO's storage methods (called directly on the
- * in-DO instance, so they're synchronous). Embedding needs the user's OpenAI
- * key, which the Worker forwards on the request (dev: header; prod: from OAuth).
+ * in-DO instance, so they're synchronous). Embedding goes through the DO's
+ * `env.AI` binding (Workers AI bge-m3) — no per-user key, nothing to forward.
  */
 import type { MemoryDO } from './memory-do.js';
-import { embedText } from './embeddings.js';
 import { formatRecall, formatRecentNotes, formatModelView, formatReceipts, formatModelIndex } from './format.js';
 
 const RECALL_LIMIT = 15;
@@ -43,7 +42,7 @@ interface ToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  handler: (memory: MemoryDO, apiKey: string, args: Record<string, unknown>) => Promise<string>;
+  handler: (memory: MemoryDO, args: Record<string, unknown>) => Promise<string>;
 }
 
 const TOOLS: ToolDef[] = [
@@ -67,19 +66,17 @@ const TOOLS: ToolDef[] = [
       },
       required: ['text', 'models'],
     },
-    handler: async (memory, apiKey, args) => {
+    handler: async (memory, args) => {
       const text = String(args.text ?? '').trim();
       const models = Array.isArray(args.models) ? args.models.map(String) : [];
       if (!text) return 'No observation text provided.';
       if (models.length === 0) return 'No models provided. Pass at least one model name in "models".';
 
-      // Embed first so the observation is immediately recallable. Cheap; if no
-      // key is configured we still store it and it can be backfilled later.
+      // Embed first so the observation is immediately recallable. Cheap; if the
+      // embed fails we still store it and it can be backfilled later.
       let embedding: number[] | undefined;
-      if (apiKey) {
-        try { embedding = await embedText(text, apiKey); }
-        catch (e) { console.error('[record_observation] embed failed, storing without vector:', e); }
-      }
+      try { embedding = await memory.embed(text); }
+      catch (e) { console.error('[record_observation] embed failed, storing without vector:', e); }
 
       const res = memory.addObservation(text, models, 'direct', embedding);
       if (!res.ok) {
@@ -87,7 +84,7 @@ const TOOLS: ToolDef[] = [
       }
       if (res.deduped) return 'Skipped as duplicate of a recent observation.';
       // Resummarize trigger — no-op unless a tagged model crossed its threshold.
-      if (apiKey) { try { await memory.maybeResummarize(res.tagged, apiKey); } catch { /* never fail recording on synthesis */ } }
+      try { await memory.maybeResummarize(res.tagged); } catch { /* never fail recording on synthesis */ }
       let out = `Recorded against: ${res.tagged.join(', ')}.`;
       // Defrag hint — nudge the agent to declutter when the index fragments.
       const frag = memory.computeFragmentation();
@@ -109,7 +106,7 @@ const TOOLS: ToolDef[] = [
       },
       required: ['name', 'description'],
     },
-    handler: async (memory, _apiKey, args) => {
+    handler: async (memory, args) => {
       const name = String(args.name ?? '').trim();
       const description = String(args.description ?? '').trim();
       if (!name || !description) return 'Both name and description are required.';
@@ -129,7 +126,7 @@ const TOOLS: ToolDef[] = [
       },
       required: ['name', 'description'],
     },
-    handler: async (memory, _apiKey, args) => {
+    handler: async (memory, args) => {
       const name = String(args.name ?? '').trim();
       const description = String(args.description ?? '').trim();
       if (!name || !description) return 'Both name and description are required.';
@@ -146,7 +143,7 @@ const TOOLS: ToolDef[] = [
       properties: { name: { type: 'string', description: 'Model to archive.' } },
       required: ['name'],
     },
-    handler: async (memory, _apiKey, args) => {
+    handler: async (memory, args) => {
       const r = memory.archiveModel(String(args.name ?? '').trim());
       return r.ok ? `Archived "${args.name}".` : r.reason!;
     },
@@ -163,7 +160,7 @@ const TOOLS: ToolDef[] = [
       },
       required: ['old_name', 'new_name'],
     },
-    handler: async (memory, _apiKey, args) => {
+    handler: async (memory, args) => {
       const r = memory.renameModel(String(args.old_name ?? '').trim(), String(args.new_name ?? '').trim());
       return r.ok ? `Renamed "${args.old_name}" → "${args.new_name}".` : r.reason!;
     },
@@ -181,11 +178,11 @@ const TOOLS: ToolDef[] = [
       },
       required: ['source', 'into', 'synthesis'],
     },
-    handler: async (memory, apiKey, args) => {
+    handler: async (memory, args) => {
       const synthesis = String(args.synthesis ?? '').trim();
       if (!synthesis) return 'Provide a synthesis of what the source model held.';
       let embedding: number[] | undefined;
-      if (apiKey) { try { embedding = await embedText(synthesis, apiKey); } catch { /* store without vector */ } }
+      try { embedding = await memory.embed(synthesis); } catch { /* store without vector */ }
       const r = memory.foldModel(String(args.source ?? '').trim(), String(args.into ?? '').trim(), synthesis, embedding);
       return r.ok ? `Folded "${args.source}" into "${args.into}" and archived the source.` : r.reason!;
     },
@@ -201,11 +198,12 @@ const TOOLS: ToolDef[] = [
       },
       required: ['query'],
     },
-    handler: async (memory, apiKey, args) => {
+    handler: async (memory, args) => {
       const query = String(args.query ?? '').trim();
       if (!query) return 'Provide a query.';
-      if (!apiKey) return 'Recall is unavailable: no embedding key is configured for this user.';
-      const qv = await embedText(query, apiKey);
+      let qv: number[];
+      try { qv = await memory.embed(query); }
+      catch (e) { console.error('[recall] embed failed:', e); return 'Recall is temporarily unavailable (embedding error). Try again shortly.'; }
       return formatRecall(memory.searchObservations(qv, RECALL_LIMIT, 0.3));
     },
   },
@@ -224,7 +222,7 @@ const TOOLS: ToolDef[] = [
       },
       required: ['topics'],
     },
-    handler: async (memory, apiKey, args) => {
+    handler: async (memory, args) => {
       const topics = Array.isArray(args.topics) ? args.topics.map(String).map(s => s.trim()).filter(Boolean) : [];
       const models = memory.listModels();
       const byName = new Map(models.map(m => [m.name, m]));
@@ -249,19 +247,23 @@ const TOOLS: ToolDef[] = [
       }
       if (views.length > 0) blocks.push(`# Loaded models\n\n${views.join('\n\n')}`);
 
-      // Free-text topics → observation RAG (needs the embedding key).
-      if (apiKey && ragTopics.length > 0) {
-        const seen = new Set<string>();
-        const receipts = [] as ReturnType<MemoryDO['searchObservations']>;
-        for (const q of ragTopics) {
-          const qv = await embedText(q, apiKey);
-          for (const m of memory.searchObservations(qv, RAG_PER_TOPIC, 0.3)) {
-            if (!seen.has(m.id)) { seen.add(m.id); receipts.push(m); }
+      // Free-text topics → observation RAG (embeds each via Workers AI).
+      if (ragTopics.length > 0) {
+        try {
+          const seen = new Set<string>();
+          const receipts = [] as ReturnType<MemoryDO['searchObservations']>;
+          for (const q of ragTopics) {
+            const qv = await memory.embed(q);
+            for (const m of memory.searchObservations(qv, RAG_PER_TOPIC, 0.3)) {
+              if (!seen.has(m.id)) { seen.add(m.id); receipts.push(m); }
+            }
           }
+          receipts.sort((a, b) => a.score - b.score);
+          const block = formatReceipts(receipts.slice(0, 12));
+          if (block) blocks.push(block);
+        } catch (e) {
+          console.error('[load_memory] rag embed failed:', e);
         }
-        receipts.sort((a, b) => a.score - b.score);
-        const block = formatReceipts(receipts.slice(0, 12));
-        if (block) blocks.push(block);
       }
 
       return blocks.filter(Boolean).join('\n\n');
@@ -287,7 +289,7 @@ function rpcError(id: string | number | null | undefined, code: number, message:
   return { jsonrpc: '2.0', id: id ?? null, error: { code, message } };
 }
 
-async function dispatch(memory: MemoryDO, apiKey: string, req: JsonRpcRequest): Promise<object | null> {
+async function dispatch(memory: MemoryDO, req: JsonRpcRequest): Promise<object | null> {
   switch (req.method) {
     case 'initialize':
       return rpcResult(req.id, {
@@ -315,7 +317,7 @@ async function dispatch(memory: MemoryDO, apiKey: string, req: JsonRpcRequest): 
       const tool = TOOLS_BY_NAME.get(name);
       if (!tool) return rpcError(req.id, -32602, `Unknown tool: ${name}`);
       try {
-        const text = await tool.handler(memory, apiKey, args);
+        const text = await tool.handler(memory, args);
         return rpcResult(req.id, { content: [{ type: 'text', text }] });
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
@@ -330,15 +332,13 @@ async function dispatch(memory: MemoryDO, apiKey: string, req: JsonRpcRequest): 
 
 /**
  * Entry point called from MemoryDO.fetch. Handles a single JSON-RPC request or
- * a batch. The user's OpenAI key arrives on the `x-openai-key` header (dev);
- * in prod the Worker injects it from the OAuth-stored key (Task #8).
+ * a batch. Embedding and synthesis run through the DO's `env.AI` binding — no
+ * API key to forward, dev or prod.
  */
 export async function handleMcpRequest(memory: MemoryDO, request: Request): Promise<Response> {
   if (request.method !== 'POST') {
     return new Response('MCP endpoint expects POST', { status: 405 });
   }
-  // Dev override via header; in prod the key is stored in the DO at OAuth onboarding.
-  const apiKey = request.headers.get('x-openai-key') || memory.getApiKey();
 
   let body: unknown;
   try {
@@ -349,10 +349,10 @@ export async function handleMcpRequest(memory: MemoryDO, request: Request): Prom
 
   // Batch or single.
   if (Array.isArray(body)) {
-    const responses = (await Promise.all(body.map(r => dispatch(memory, apiKey, r as JsonRpcRequest)))).filter(Boolean);
+    const responses = (await Promise.all(body.map(r => dispatch(memory, r as JsonRpcRequest)))).filter(Boolean);
     return responses.length === 0 ? new Response(null, { status: 202 }) : Response.json(responses);
   }
 
-  const response = await dispatch(memory, apiKey, body as JsonRpcRequest);
+  const response = await dispatch(memory, body as JsonRpcRequest);
   return response === null ? new Response(null, { status: 202 }) : Response.json(response);
 }

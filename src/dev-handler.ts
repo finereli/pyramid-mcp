@@ -1,10 +1,11 @@
 /**
  * Dev handler — header-based auth for local development and the eval/seed
  * scripts. Active only when DEV_AUTH=true (set in .dev.vars, never in prod).
- * Routes by `x-user-id`; the OpenAI key rides `x-openai-key`. Production uses
- * the OAuth path in oauth.ts instead.
+ * Routes by `x-user-id`. Embedding + synthesis run on Workers AI (env.AI), so
+ * there's no key to pass. Production uses the OAuth path in oauth.ts instead.
  */
 import type { Env } from './index.js';
+import { landingResponse } from './landing.js';
 
 export async function devHandler(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -19,10 +20,9 @@ export async function devHandler(request: Request, env: Env): Promise<Response> 
 
   if (url.pathname === '/rebuild' && request.method === 'POST') {
     const userId = request.headers.get('x-user-id');
-    const apiKey = request.headers.get('x-openai-key');
-    if (!userId || !apiKey) return new Response('Missing x-user-id or x-openai-key', { status: 401 });
+    if (!userId) return new Response('Missing x-user-id', { status: 401 });
     const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
-    return Response.json(await stub.rebuildAllSummaries(apiKey));
+    return Response.json(await stub.rebuildAllSummaries());
   }
 
   if (url.pathname === '/mcp') {
@@ -31,6 +31,8 @@ export async function devHandler(request: Request, env: Env): Promise<Response> 
     const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
     return stub.fetch(request);
   }
+
+  if (url.pathname === '/' && request.method === 'GET') return landingResponse();
 
   return new Response('pyramid-mcp (dev auth) — POST /mcp with x-user-id. See SPEC.md.', { status: 200 });
 }
@@ -56,9 +58,8 @@ export async function adminHandler(request: Request, env: Env): Promise<Response
 
   if (url.pathname === '/admin/rebuild' && request.method === 'POST') {
     const { userId } = (await request.json()) as { userId?: string };
-    const apiKey = request.headers.get('x-openai-key');
-    if (!userId || !apiKey) return new Response('userId (body) + x-openai-key (header) required', { status: 400 });
-    return Response.json(await stubFor(userId).rebuildAllSummaries(apiKey));
+    if (!userId) return new Response('userId (body) required', { status: 400 });
+    return Response.json(await stubFor(userId).rebuildAllSummaries());
   }
 
   return new Response('unknown admin route', { status: 404 });

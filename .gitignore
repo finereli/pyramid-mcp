@@ -12,3 +12,4 @@ seed-data/
 
 # eval output — contains personal memory, never commit
 eval-report.md
+scripts/synth-ab-report.md

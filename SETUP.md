@@ -9,10 +9,11 @@ any of this.
 `.dev.vars` (gitignored):
 ```
 DEV_AUTH=true
-OPENAI_API_KEY=sk-...
+# WORKERS_AI_TOKEN=...   # only for `build-seed --embed`; CLOUDFLARE_API_TOKEN works too
 ```
 Then `npm run dev`, `tsx scripts/load-seed.ts --user eli`, and connect Claude
-Code with `--header "x-user-id: eli" --header "x-openai-key: sk-..."`.
+Code with `--header "x-user-id: eli"`. Embeddings + synthesis run on Workers AI
+(`env.AI`) — no key to pass.
 
 ## Production deploy
 
@@ -39,16 +40,15 @@ Code with `--header "x-user-id: eli" --header "x-openai-key: sk-..."`.
    ```
 
 5. **Connect a client** (Claude, ChatGPT) to `https://<your-worker-domain>/mcp`.
-   The client runs the OAuth flow → you sign in with Google → you paste your
-   OpenAI key once (stored in your own memory DO) → done.
+   The client runs the OAuth flow → you sign in with Google → done. No API key
+   to paste — embeddings + synthesis run on Workers AI (`env.AI`).
 
 ## Auth flow (what oauth.ts does)
 
 ```
 MCP client → /authorize → redirect to Google
 Google → /callback → exchange code, fetch userinfo (sub, email)
-        → one-field page: paste OpenAI key
-/finish → store key in MemoryDO(sub) → completeAuthorization(props:{userId:sub})
+        → completeAuthorization(props:{userId:sub})  (no BYOK step)
 MCP client now calls /mcp with a bearer token; props.userId routes to the DO.
 ```
 

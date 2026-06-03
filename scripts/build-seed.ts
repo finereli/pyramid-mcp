@@ -7,18 +7,21 @@
  * Usage:
  *   tsx scripts/build-seed.ts [--db <path/to/test6.db>] [--out seed-data/seed.json] [--embed]
  *
- * --embed requires OPENAI_API_KEY (env or .dev.vars). Embedding the ~1,727
- * unique observations costs well under a cent. Without it, a structural seed is
- * written (no vectors) so recall is unavailable until backfilled.
+ * --embed requires a Workers AI token (CLOUDFLARE_API_TOKEN env, or
+ * WORKERS_AI_TOKEN in .dev.vars) with the "Workers AI" permission. Embeds via
+ * bge-m3 (1024-dim) — the same model the Worker uses at runtime, so the seed
+ * vectors live in the same cosine space. Costs well under a cent. Without it, a
+ * structural seed is written (no vectors) so recall is unavailable until backfilled.
  *
  * Output is gitignored (seed-data/) — it's real user memory.
  */
 import Database from 'better-sqlite3';
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { embedTexts } from '../src/embeddings.js';
+import { embedRest } from '../src/embeddings.js';
 
 const DEFAULT_DB = '/Users/eli/source/glopus/data/memory-redesign/k111/test6.db';
+const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID ?? '7485eb8ab648601f411b650cd794bce3';
 const SKIP_MODELS = new Set(['recent']); // pyramid-mcp covers continuity via recentObservations()
 
 interface SeedObservation { text: string; timestamp: number; models: string[]; embedding?: number[] }
@@ -29,12 +32,12 @@ function arg(flag: string): string | undefined {
   return i >= 0 ? process.argv[i + 1] : undefined;
 }
 
-function loadApiKey(): string | undefined {
-  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
+function loadToken(): string | undefined {
+  if (process.env.CLOUDFLARE_API_TOKEN) return process.env.CLOUDFLARE_API_TOKEN;
   // fall back to .dev.vars (KEY=VALUE lines)
   if (existsSync('.dev.vars')) {
     for (const line of readFileSync('.dev.vars', 'utf8').split('\n')) {
-      const m = line.match(/^\s*OPENAI_API_KEY\s*=\s*(.+?)\s*$/);
+      const m = line.match(/^\s*WORKERS_AI_TOKEN\s*=\s*(.+?)\s*$/);
       if (m) return m[1]!.replace(/^["']|["']$/g, '');
     }
   }
@@ -71,15 +74,36 @@ async function main() {
   console.log(`observations: ${observations.length} (tag assignments ${tagTotal}, inflation ${(tagTotal / observations.length).toFixed(2)})`);
 
   if (doEmbed) {
-    const apiKey = loadApiKey();
-    if (!apiKey) { console.error('--embed set but no OPENAI_API_KEY (env or .dev.vars). Aborting.'); process.exit(1); }
-    console.log('embedding (batches of 256)…');
-    const BATCH = 256;
-    for (let i = 0; i < observations.length; i += BATCH) {
-      const slice = observations.slice(i, i + BATCH);
-      const vecs = await embedTexts(slice.map(o => o.text), apiKey);
+    const token = loadToken();
+    if (!token) { console.error('--embed set but no Workers AI token (CLOUDFLARE_API_TOKEN env or WORKERS_AI_TOKEN in .dev.vars). Aborting.'); process.exit(1); }
+
+    // bge-m3 caps a request at 60k tokens across the whole batch, and dense
+    // maintenance-log text tokenizes far heavier than chars/4 suggests. Rather
+    // than guess the ratio, embed adaptively: try a batch, and on the cap error
+    // split it in half and retry until it fits.
+    async function embedAdaptive(texts: string[]): Promise<number[][]> {
+      try {
+        return await embedRest(token!, CF_ACCOUNT_ID, texts);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (texts.length > 1 && /Max context|context reached|too large|400/.test(msg)) {
+          const mid = Math.ceil(texts.length / 2);
+          const [a, b] = await Promise.all([embedAdaptive(texts.slice(0, mid)), embedAdaptive(texts.slice(mid))]);
+          return [...a, ...b];
+        }
+        throw e;
+      }
+    }
+
+    console.log('embedding via Workers AI bge-m3 (adaptive batches)…');
+    const START_BATCH = 50;
+    let done = 0;
+    for (let i = 0; i < observations.length; i += START_BATCH) {
+      const slice = observations.slice(i, i + START_BATCH);
+      const vecs = await embedAdaptive(slice.map(o => o.text));
       slice.forEach((o, j) => { o.embedding = vecs[j]; });
-      console.log(`  embedded ${Math.min(i + BATCH, observations.length)}/${observations.length}`);
+      done += slice.length;
+      console.log(`  embedded ${done}/${observations.length}`);
     }
   }
 

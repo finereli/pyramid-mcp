@@ -44,7 +44,7 @@ export function bucketObservations(obs: ObservationRow[], now: number): TierBuck
 
 function isoDate(ts: number): string { return new Date(ts).toISOString().slice(0, 10); }
 
-const SYNTH_SYSTEM = `You synthesize a personal AI assistant's memory observations into one compact narrative for a SINGLE mental model, written from that model's lens. Preserve names, decisions, numbers, dates, and the participants' own voice and phrasing. Capture the arc — what developed, what shifted, what's open — not a flat list. Output ONLY the synthesis prose, no preamble or headers. Respect the target length (older windows compress harder).`;
+const SYNTH_SYSTEM = `You synthesize a personal AI assistant's memory observations into one compact narrative for a SINGLE mental model, written from that model's lens. Preserve names, decisions, numbers, dates, and the participants' own voice and phrasing — keep the specifics, they are what makes a memory verifiable later. Trace the arc with causal connective tissue (what developed, what shifted because of what, what's still open) — narrative, NOT a flat list of facts and NOT a generic "overall, things evolved" closer. Output ONLY the synthesis prose, no preamble or headers. Hold to the target length: it is a hard ceiling, and older windows must compress HARDER — be ruthless about cutting in the oldest tiers, keeping only the load-bearing facts and the shape of the arc.`;
 
 export interface SynthJob { system: string; user: string; maxTokens: number; startTs: number; endTs: number; sourceCount: number; tier: number }
 
@@ -75,7 +75,10 @@ export function buildSynthJob(model: ModelRow, bucket: TierBucket): SynthJob {
   return {
     system: SYNTH_SYSTEM,
     user,
-    maxTokens: Math.ceil(bucket.tier.targetChars / 3) + 200,
+    // Hard output ceiling ≈ targetChars worth of tokens with a small buffer.
+    // Tight on purpose: 70B otherwise inflated the oldest tiers past their
+    // target (it ignores a soft instruction, but respects a token cap).
+    maxTokens: Math.ceil(bucket.tier.targetChars / 3.3) + 50,
     startTs,
     endTs,
     sourceCount: obs.length,

@@ -1,9 +1,10 @@
 /**
  * seed-prod.ts — one-time seed of a deployed pyramid-mcp via the token-gated
  * /admin endpoints. Loads the embedded seed into a specific user's DO and
- * rebuilds the pyramid.
+ * rebuilds the pyramid. Embedding + synthesis run on Workers AI server-side, so
+ * there's no key to pass.
  *
- * Reads ADMIN_TOKEN and OPENAI_API_KEY from .dev.vars.
+ * Reads ADMIN_TOKEN from .dev.vars.
  * Usage: tsx scripts/seed-prod.ts --user <google-sub> [--url https://pyramid.finereli.com]
  */
 import { readFileSync, existsSync } from 'node:fs';
@@ -25,7 +26,6 @@ function fromDevVars(key: string): string {
 const BASE = arg('--url', 'https://pyramid.finereli.com');
 const USER = arg('--user');
 const ADMIN_TOKEN = fromDevVars('ADMIN_TOKEN');
-const OPENAI_KEY = fromDevVars('OPENAI_API_KEY');
 const SEED = 'seed-data/seed.json';
 
 async function admin(path: string, body: object, extraHeaders: Record<string, string> = {}): Promise<any> {
@@ -51,7 +51,7 @@ async function main() {
     process.stdout.write(`\r  loaded ${Math.min(i + CHUNK, seed.observations.length)}/${seed.observations.length}`);
   }
   console.log('\nbuilding pyramid…');
-  console.log('  ' + JSON.stringify(await admin('/admin/rebuild', { userId: USER }, { 'x-openai-key': OPENAI_KEY })));
+  console.log('  ' + JSON.stringify(await admin('/admin/rebuild', { userId: USER })));
   console.log('done.');
 }
 

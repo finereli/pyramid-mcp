@@ -6,6 +6,10 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
+  // Workers AI — embeddings (bge-m3) and pyramid synthesis (Llama 3.3 70B).
+  // Removes the OpenAI BYOK dependency; billed to the Cloudflare account.
+  "ai": { "binding": "AI" },
+
   // Custom domain — wrangler provisions DNS + cert for this on the finereli.com zone.
   "routes": [
     { "pattern": "pyramid.finereli.com", "custom_domain": true }
