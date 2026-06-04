@@ -14,7 +14,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { handleMcpRequest } from './mcp.js';
 import { synthesize } from './synth.js';
-import { embedOne } from './embeddings.js';
+import { embed, embedOne, EMBEDDING_DIM } from './embeddings.js';
 import { bucketObservations, buildSynthJob } from './pyramid.js';
 
 export interface Env {
@@ -157,6 +157,30 @@ export class MemoryDO extends DurableObject<Env> {
   /** Embed one text. Throws on failure; callers decide whether that's fatal. */
   embed(text: string): Promise<number[]> {
     return embedOne(this.env.AI, text);
+  }
+
+  /**
+   * Re-embed observations whose stored vector isn't the current bge-m3
+   * dimension (or is missing) — the in-place migration off OpenAI's 1536-dim
+   * space. Processes up to `limit` per call so the caller can loop and stay
+   * within per-request subrequest limits. Idempotent: re-running only touches
+   * vectors not yet at EMBEDDING_DIM.
+   */
+  async reembedBatch(limit = 20): Promise<{ done: number; remaining: number; dim: number }> {
+    const targetBytes = EMBEDDING_DIM * 4; // Float32
+    const rows = this.sql.exec(
+      'SELECT id, text FROM observations WHERE embedding IS NULL OR LENGTH(embedding) != ? LIMIT ?',
+      targetBytes, limit,
+    ).toArray() as Array<{ id: string; text: string }>;
+    if (rows.length > 0) {
+      const vecs = await embed(this.env.AI, rows.map(r => r.text));
+      rows.forEach((r, i) => this.setObservationEmbedding(r.id, vecs[i]!));
+    }
+    const remaining = (this.sql.exec(
+      'SELECT COUNT(*) AS c FROM observations WHERE embedding IS NULL OR LENGTH(embedding) != ?',
+      targetBytes,
+    ).one() as { c: number }).c;
+    return { done: rows.length, remaining, dim: EMBEDDING_DIM };
   }
 
   // ---------- Models ----------

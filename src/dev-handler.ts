@@ -69,6 +69,14 @@ export async function adminHandler(request: Request, env: Env): Promise<Response
     return Response.json(await stubFor(userId).getStats());
   }
 
+  // In-place migration — re-embed a batch of observations to the current model's
+  // dimension (bge-m3). Loop until remaining hits 0. Non-destructive.
+  if (url.pathname === '/admin/reembed' && request.method === 'POST') {
+    const { userId, limit } = (await request.json()) as { userId?: string; limit?: number };
+    if (!userId) return new Response('userId (body) required', { status: 400 });
+    return Response.json(await stubFor(userId).reembedBatch(limit ?? 20));
+  }
+
   // Destructive — wipe a user's memory back to the seed models. Requires confirm:true.
   if (url.pathname === '/admin/reset' && request.method === 'POST') {
     const { userId, confirm } = (await request.json()) as { userId?: string; confirm?: boolean };
