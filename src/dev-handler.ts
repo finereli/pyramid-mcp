@@ -69,6 +69,16 @@ export async function adminHandler(request: Request, env: Env): Promise<Response
     return Response.json(await stubFor(userId).getStats());
   }
 
+  // Read-only — run a recall against a user's DO (verifies the full embed+search
+  // path end-to-end, e.g. after a migration). Returns top matches.
+  if (url.pathname === '/admin/recall' && request.method === 'POST') {
+    const { userId, query, limit } = (await request.json()) as { userId?: string; query?: string; limit?: number };
+    if (!userId || !query) return new Response('userId + query (body) required', { status: 400 });
+    const stub = stubFor(userId);
+    const qv = await stub.embed(query);
+    return Response.json(await stub.searchObservations(qv, limit ?? 8, 0.3));
+  }
+
   // In-place migration — re-embed a batch of observations to the current model's
   // dimension (bge-m3). Loop until remaining hits 0. Non-destructive.
   if (url.pathname === '/admin/reembed' && request.method === 'POST') {
