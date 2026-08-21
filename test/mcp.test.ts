@@ -1,4 +1,4 @@
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 
 interface RpcResponse {
@@ -83,6 +83,17 @@ describe('MCP transport over /mcp', () => {
     const names = ((await res.json()) as RpcResponse).result.tools.map((t: any) => t.name);
     expect(names).toContain('recall');
     expect(names).toContain('load_memory');
+    expect(names).toContain('memory_stats');
+  });
+
+  it('memory_stats reports counts and size distribution', async () => {
+    const u = user();
+    await rpc(u, { jsonrpc: '2.0', id: 70, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'a short note about Eli', models: ['user'] } } });
+    const res = await rpc(u, { jsonrpc: '2.0', id: 71, method: 'tools/call', params: { name: 'memory_stats', arguments: {} } });
+    const text = ((await res.json()) as RpcResponse).result.content[0].text as string;
+    expect(text).toMatch(/Observations: 1/);
+    expect(text).toMatch(/Observations \(1\): min 22 chars/);
+    expect(text).toMatch(/- user \[seed\]: 1 obs/);
   });
 
   it('recall returns a well-formed result (no BYOK key required)', async () => {
@@ -108,5 +119,27 @@ describe('MCP transport over /mcp', () => {
     expect(text).toContain('# Loaded models');
     expect(text).toContain('## coaching');
     expect(text).toContain('coaching call with Cristi');
+  });
+
+  it('load_memory shows summaries plus only the unsummarized verbatim tail', async () => {
+    const u = user();
+    const DAY = 86_400_000;
+    const now = Date.now();
+    await rpc(u, { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'create_model', arguments: { name: 'coaching', description: 'coaching practice' } } });
+
+    // Seed pyramid state directly in the user's DO (same idFromName mapping the
+    // worker uses): one old observation, rolled into a tier summary.
+    const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(u));
+    await stub.bulkLoad([], [{ text: 'ancient covered detail about Cristi pricing', timestamp: now - 10 * DAY, models: ['coaching'] }]);
+    const m = await stub.getModel('coaching');
+    await stub.insertSummary(m!.id, { tier: 0, text: 'Compressed arc: the Cristi engagement took shape.', startTimestamp: now - 10 * DAY, endTimestamp: now - 10 * DAY, sourceCount: 1 });
+
+    await rpc(u, { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Fresh note recorded after the summary', models: ['coaching'] } } });
+
+    const res = await rpc(u, { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'load_memory', arguments: { topics: ['coaching'] } } });
+    const text = ((await res.json()) as RpcResponse).result.content[0].text;
+    expect(text).toContain('Compressed arc');                       // summary carries the history
+    expect(text).toContain('Fresh note recorded after the summary'); // unsummarized tail stays verbatim
+    expect(text).not.toContain('ancient covered detail');            // covered obs never repeats — not in the model view, not in Recent notes
   });
 });

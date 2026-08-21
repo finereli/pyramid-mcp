@@ -63,11 +63,18 @@ export const googleAuthHandler = {
           grant_type: 'authorization_code',
         }),
       });
-      if (!tokenRes.ok) return new Response(`Google token exchange failed: ${await tokenRes.text()}`, { status: 502 });
+      if (!tokenRes.ok) {
+        const body = await tokenRes.text();
+        console.error('oauth:token-exchange', { status: tokenRes.status, body });
+        return new Response(`Google token exchange failed: ${body}`, { status: 502 });
+      }
       const { access_token } = (await tokenRes.json()) as { access_token: string };
 
       const infoRes = await fetch(GOOGLE_USERINFO, { headers: { Authorization: `Bearer ${access_token}` } });
-      if (!infoRes.ok) return new Response('Google userinfo failed', { status: 502 });
+      if (!infoRes.ok) {
+        console.error('oauth:userinfo', { status: infoRes.status });
+        return new Response('Google userinfo failed', { status: 502 });
+      }
       const { sub, email } = (await infoRes.json()) as { sub: string; email: string };
 
       // No BYOK step — Workers AI (env.AI) handles embedding + synthesis, so we
@@ -92,10 +99,17 @@ export const mcpApiHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname !== '/mcp') return new Response('Not found', { status: 404 });
-    // props were set in completeAuthorization and ride the access token.
     const userId = (ctx as unknown as { props?: { userId?: string } }).props?.userId;
-    if (!userId) return new Response('Unauthorized', { status: 401 });
-    const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
-    return stub.fetch(request);
+    if (!userId) {
+      console.error('mcp:auth', { error: 'no userId in token props' });
+      return new Response('Unauthorized', { status: 401 });
+    }
+    try {
+      const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
+      return await stub.fetch(request);
+    } catch (e) {
+      console.error('mcp:do-error', { userId, error: String(e), stack: e instanceof Error ? e.stack : undefined });
+      throw e;
+    }
   },
 };

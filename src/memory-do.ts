@@ -159,6 +159,16 @@ export class MemoryDO extends DurableObject<Env> {
     return embedOne(this.env.AI, text);
   }
 
+  /** Embed multiple texts in one round trip. */
+  embedMany(texts: string[]): Promise<number[][]> {
+    return embed(this.env.AI, texts);
+  }
+
+  /** Schedule async work that outlives the current request. */
+  background(fn: Promise<unknown>): void {
+    this.ctx.waitUntil(fn);
+  }
+
   /**
    * Re-embed observations whose stored vector isn't the current bge-m3
    * dimension (or is missing) — the in-place migration off OpenAI's 1536-dim
@@ -337,15 +347,23 @@ export class MemoryDO extends DurableObject<Env> {
     return recent.some(o => o.text.substring(0, DEDUP_PREFIX_CHARS).toLowerCase().trim() === prefix);
   }
 
-  listObservationsForModel(modelId: string, limit = 200): ObservationRow[] {
+  /**
+   * A model's observations, newest first. `afterTs` (exclusive) restricts to
+   * observations newer than that timestamp — the read path passes the latest
+   * summary's end timestamp so views show only the unsummarized tail, while the
+   * synthesis path omits it to see everything. An observation stamped exactly
+   * at a summary's end is the last one that summary covered, so strict > is
+   * the right boundary.
+   */
+  listObservationsForModel(modelId: string, limit = 200, afterTs = 0): ObservationRow[] {
     const rows = this.sql.exec(
       `SELECT o.id, o.text, o.timestamp, o.source
        FROM observations o
        JOIN observation_tags t ON t.observation_id = o.id
-       WHERE t.model_id = ?
+       WHERE t.model_id = ? AND o.timestamp > ?
        ORDER BY o.timestamp DESC
        LIMIT ?`,
-      modelId, limit,
+      modelId, afterTs, limit,
     ).toArray() as Array<Record<string, unknown>>;
     return rows.map(toObservationRow);
   }
@@ -365,6 +383,16 @@ export class MemoryDO extends DurableObject<Env> {
       endTimestamp: r.end_timestamp as number,
       sourceCount: r.source_count as number,
     }));
+  }
+
+  /** Insert one tier summary row. Used by rebuildModelSummaries; public so tests and migrations can seed pyramid state without invoking synthesis. */
+  insertSummary(modelId: string, s: { tier: number; text: string; startTimestamp: number; endTimestamp: number; sourceCount: number }): string {
+    const id = crypto.randomUUID();
+    this.sql.exec(
+      'INSERT INTO summaries (id, model_id, tier, text, start_timestamp, end_timestamp, source_count, is_dirty) VALUES (?, ?, ?, ?, ?, ?, ?, 0)',
+      id, modelId, s.tier, s.text, s.startTimestamp, s.endTimestamp, s.sourceCount,
+    );
+    return id;
   }
 
   private getModelById(id: string): ModelRow | undefined {
@@ -389,10 +417,7 @@ export class MemoryDO extends DurableObject<Env> {
 
     this.sql.exec('DELETE FROM summaries WHERE model_id = ?', modelId);
     jobs.forEach((j, i) => {
-      this.sql.exec(
-        'INSERT INTO summaries (id, model_id, tier, text, start_timestamp, end_timestamp, source_count, is_dirty) VALUES (?, ?, ?, ?, ?, ?, ?, 0)',
-        crypto.randomUUID(), modelId, j.tier, texts[i], j.startTs, j.endTs, j.sourceCount,
-      );
+      this.insertSummary(modelId, { tier: j.tier, text: texts[i]!, startTimestamp: j.startTs, endTimestamp: j.endTs, sourceCount: j.sourceCount });
     });
     this.sql.exec('UPDATE models SET last_summarized_count = ? WHERE id = ?', obs.length, modelId);
     return jobs.length;
@@ -434,11 +459,31 @@ export class MemoryDO extends DurableObject<Env> {
     return rebuilt;
   }
 
-  /** Recency-first across all models — the short-term continuity substitute. */
+  /**
+   * Recency-first across all models — the short-term continuity substitute.
+   * Skips observations already rolled into the pyramid: an observation is
+   * covered once EVERY model it's tagged to has a summary reaching its
+   * timestamp. Covered history lives in the tier summaries; repeating it here
+   * verbatim would defeat the compression (the 71K-response bug). Untagged
+   * observations count as uncovered.
+   */
   recentObservations(limit = 30): ObservationRow[] {
-    const rows = this.sql
-      .exec('SELECT id, text, timestamp, source FROM observations ORDER BY timestamp DESC LIMIT ?', limit)
-      .toArray() as Array<Record<string, unknown>>;
+    const rows = this.sql.exec(
+      `SELECT o.id, o.text, o.timestamp, o.source
+       FROM observations o
+       WHERE NOT EXISTS (SELECT 1 FROM observation_tags t WHERE t.observation_id = o.id)
+          OR EXISTS (
+            SELECT 1 FROM observation_tags t
+            WHERE t.observation_id = o.id
+              AND NOT EXISTS (
+                SELECT 1 FROM summaries s
+                WHERE s.model_id = t.model_id AND s.end_timestamp >= o.timestamp
+              )
+          )
+       ORDER BY o.timestamp DESC
+       LIMIT ?`,
+      limit,
+    ).toArray() as Array<Record<string, unknown>>;
     return rows.map(toObservationRow);
   }
 
@@ -511,7 +556,7 @@ export class MemoryDO extends DurableObject<Env> {
     return { activeModels: models.length, underPopulated: under, fragmented: under >= 6 || models.length > 40 };
   }
 
-  getStats(): { models: number; observations: number; summaries: number; embedded: number; embeddingDim: number } {
+  getStats(): { models: number; observations: number; summaries: number; embedded: number; embeddingDim: number; observationSize: SizeStats; summarySize: SizeStats; perModel: ModelStats[] } {
     // Blob byte length / 4 (Float32) = vector dimension. Lets a migration check
     // distinguish old 1536-dim (OpenAI) data from new 1024-dim (bge-m3).
     const dimRow = this.sql.exec('SELECT LENGTH(embedding) AS b FROM observations WHERE embedding IS NOT NULL LIMIT 1').toArray()[0] as { b: number } | undefined;
@@ -521,6 +566,57 @@ export class MemoryDO extends DurableObject<Env> {
       summaries: this.sql.exec('SELECT COUNT(*) AS c FROM summaries').one().c as number,
       embedded: this.sql.exec('SELECT COUNT(*) AS c FROM observations WHERE embedding IS NOT NULL').one().c as number,
       embeddingDim: dimRow ? dimRow.b / 4 : 0,
+      observationSize: this.sizeStats('observations'),
+      summarySize: this.sizeStats('summaries'),
+      perModel: this.perModelStats(),
+    };
+  }
+
+  /** One row per model (active and archived), biggest first: observation + summary counts, sizes, tier depth, time span. */
+  private perModelStats(): ModelStats[] {
+    const rows = this.sql.exec(
+      `SELECT m.name, m.is_seed, m.archived, m.created_at,
+              (SELECT COUNT(*) FROM observation_tags t WHERE t.model_id = m.id) AS obs,
+              (SELECT COALESCE(SUM(LENGTH(o.text)), 0) FROM observation_tags t JOIN observations o ON o.id = t.observation_id WHERE t.model_id = m.id) AS obs_chars,
+              (SELECT MIN(o.timestamp) FROM observation_tags t JOIN observations o ON o.id = t.observation_id WHERE t.model_id = m.id) AS earliest,
+              (SELECT MAX(o.timestamp) FROM observation_tags t JOIN observations o ON o.id = t.observation_id WHERE t.model_id = m.id) AS latest,
+              (SELECT COUNT(*) FROM summaries s WHERE s.model_id = m.id) AS sums,
+              (SELECT COALESCE(SUM(LENGTH(s.text)), 0) FROM summaries s WHERE s.model_id = m.id) AS sum_chars,
+              (SELECT COALESCE(MAX(s.tier), -1) FROM summaries s WHERE s.model_id = m.id) AS top_tier
+       FROM models m
+       ORDER BY obs DESC, m.name`,
+    ).toArray() as Array<{ name: string; is_seed: number; archived: number; created_at: number; obs: number; obs_chars: number; earliest: number | null; latest: number | null; sums: number; sum_chars: number; top_tier: number }>;
+    return rows.map(r => ({
+      name: r.name,
+      seed: r.is_seed === 1,
+      archived: r.archived === 1,
+      createdAt: r.created_at,
+      observations: r.obs,
+      observationChars: r.obs_chars,
+      observationTokens: Math.round(r.obs_chars / 4),
+      meanObservationChars: r.obs ? Math.round(r.obs_chars / r.obs) : 0,
+      earliest: r.earliest,
+      latest: r.latest,
+      summaries: r.sums,
+      summaryChars: r.sum_chars,
+      summaryTokens: Math.round(r.sum_chars / 4),
+      topTier: r.top_tier,
+    }));
+  }
+
+  /** Text-length distribution for a table with a `text` column. Tokens are a chars/4 estimate. */
+  private sizeStats(table: 'observations' | 'summaries'): SizeStats {
+    const lens = (this.sql.exec(`SELECT LENGTH(text) AS n FROM ${table} ORDER BY n`).toArray() as Array<{ n: number }>).map(r => r.n);
+    if (lens.length === 0) return { count: 0, minChars: 0, maxChars: 0, meanChars: 0, medianChars: 0, totalChars: 0, minTokens: 0, maxTokens: 0, meanTokens: 0, medianTokens: 0, totalTokens: 0 };
+    const total = lens.reduce((a, b) => a + b, 0);
+    const mid = lens.length >> 1;
+    const median = lens.length % 2 ? lens[mid]! : (lens[mid - 1]! + lens[mid]!) / 2;
+    const tok = (c: number) => Math.round(c / 4);
+    const mean = Math.round(total / lens.length);
+    return {
+      count: lens.length,
+      minChars: lens[0]!, maxChars: lens[lens.length - 1]!, meanChars: mean, medianChars: Math.round(median), totalChars: total,
+      minTokens: tok(lens[0]!), maxTokens: tok(lens[lens.length - 1]!), meanTokens: tok(mean), medianTokens: tok(median), totalTokens: tok(total),
     };
   }
 
@@ -539,6 +635,19 @@ export class MemoryDO extends DurableObject<Env> {
     this.ensureSeedModels();
     return { cleared: true };
   }
+}
+
+export interface ModelStats {
+  name: string; seed: boolean; archived: boolean; createdAt: number;
+  observations: number; observationChars: number; observationTokens: number; meanObservationChars: number;
+  earliest: number | null; latest: number | null;
+  summaries: number; summaryChars: number; summaryTokens: number; topTier: number;
+}
+
+export interface SizeStats {
+  count: number;
+  minChars: number; maxChars: number; meanChars: number; medianChars: number; totalChars: number;
+  minTokens: number; maxTokens: number; meanTokens: number; medianTokens: number; totalTokens: number;
 }
 
 // ---------- helpers ----------

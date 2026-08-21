@@ -55,9 +55,11 @@ export function formatRecentNotes(obs: ObservationRow[], capChars = 6000): strin
 
 /**
  * A model view: description + confidence, tiered summaries (oldest→newest, with
- * tier metadata), then recent verbatim observations (oldest→newest). Summaries
- * are empty until the pyramid (Task #6) populates them; the view degrades to
- * recent observations alone, which is correct.
+ * tier metadata), then recent verbatim observations (oldest→newest). The caller
+ * passes only the UNSUMMARIZED tail as recentObs — observations a summary
+ * already covers must not reappear verbatim, or the view carries the same
+ * history twice. Summaries are empty until the pyramid populates them; the view
+ * degrades to recent observations alone, which is correct.
  */
 export function formatModelView(
   model: ModelRow,

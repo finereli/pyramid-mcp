@@ -41,6 +41,69 @@ The pitch above is the experience; this is the machinery.
 
 This is the memory architecture proven inside [Glopus](https://glopus.finereli.com), repackaged so any MCP-capable backend can plug into it. See **[SPEC.md](./SPEC.md)** for the full design.
 
+## Claude Code integration
+
+The server's MCP `instructions` tell the agent to call `load_memory` at
+conversation start and `record_observation` as it goes. That works, but it's a
+soft instruction - the model can forget or skip it.
+
+Claude Code hooks make it guaranteed. A `SessionStart` hook calls `load_memory`
+automatically before the first turn, using the `mcp_tool` hook type to invoke
+Pyramid directly - no model cooperation needed.
+
+Add this to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "pyramid",
+            "tool": "load_memory",
+            "input": {
+              "topics": ["user", "self", "memory"]
+            },
+            "statusMessage": "Loading memory..."
+          }
+        ]
+      }
+    ]
+  },
+  "autoMemoryEnabled": false
+}
+```
+
+The `server` name must match your MCP server name (whatever you passed to
+`claude mcp add`). If you connected via a claude.ai connector, it's
+`"claude.ai Pyramid"`.
+
+**Topics:** Pyramid ships with five seed models - `user`, `self`, `system`,
+`world`, and `memory`. The three in the hook above are the most useful on every
+conversation: `user` loads context about the person you serve, `self` loads the
+agent's own identity and voice, and `memory` loads how the memory system works.
+The model sees the full model index in the response and can load more
+(project-specific models, people, etc.) once it knows what the conversation is
+about.
+
+**`autoMemoryEnabled: false`** disables Claude Code's built-in file-based memory
+system at the harness level. Without this, the system prompt includes lengthy
+instructions for a markdown-file memory system you're not using - wasted context.
+
+Then add to your `CLAUDE.md`:
+
+```markdown
+# Memory
+
+Use Pyramid MCP exclusively for long-term memory. A SessionStart hook
+auto-loads the user, self, and memory models. On your first turn, check
+the model index and call load_memory again with conversation-specific
+models if relevant. Record observations as you go - don't batch them for
+the end. Use recall to verify specific facts before stating them.
+```
+
 ## Develop
 
 ```bash

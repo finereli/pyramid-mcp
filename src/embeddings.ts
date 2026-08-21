@@ -13,11 +13,26 @@ export const EMBEDDING_DIM = 1024;
 
 interface BgeResponse { data: number[][] }
 
+const EMBED_TIMEOUT_MS = 8000;
+
 /** Embed a batch via the Workers AI binding. Returns vectors in input order. */
 export async function embed(ai: Ai, texts: string[]): Promise<number[][]> {
   if (texts.length === 0) return [];
-  const res = (await ai.run(EMBEDDING_MODEL, { text: texts })) as unknown as BgeResponse;
-  return res.data;
+  const t0 = Date.now();
+  try {
+    const res = await Promise.race([
+      ai.run(EMBEDDING_MODEL, { text: texts }) as unknown as Promise<BgeResponse>,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`embed timeout after ${EMBED_TIMEOUT_MS}ms`)), EMBED_TIMEOUT_MS)),
+    ]);
+    const ms = Date.now() - t0;
+    if (ms > 3000) console.log('embed:slow', { count: texts.length, ms });
+    return res.data;
+  } catch (e) {
+    const ms = Date.now() - t0;
+    console.error('embed:error', { count: texts.length, ms, error: String(e) });
+    throw e;
+  }
 }
 
 /** Single-text helper. */

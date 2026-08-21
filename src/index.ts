@@ -40,9 +40,26 @@ const oauthProvider = new OAuthProvider({
 });
 
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Response | Promise<Response> {
-    if (new URL(request.url).pathname.startsWith('/admin/')) return adminHandler(request, env);
-    if (env.DEV_AUTH === 'true') return devHandler(request, env);
-    return oauthProvider.fetch(request, env, ctx);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    const start = Date.now();
+    let response: Response;
+    try {
+      if (url.pathname.startsWith('/admin/')) {
+        response = await adminHandler(request, env);
+      } else if (env.DEV_AUTH === 'true') {
+        response = await devHandler(request, env);
+      } else {
+        response = await oauthProvider.fetch(request, env, ctx);
+      }
+    } catch (err) {
+      console.error('Unhandled error', { path: url.pathname, method: request.method, error: String(err), stack: err instanceof Error ? err.stack : undefined });
+      response = new Response('Internal error', { status: 500 });
+    }
+    const ms = Date.now() - start;
+    if (ms > 1000 || response.status >= 500) {
+      console.log('req', { method: request.method, path: url.pathname, status: response.status, ms });
+    }
+    return response;
   },
 };

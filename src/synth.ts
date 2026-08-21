@@ -23,13 +23,23 @@ export async function synthesize(
   user: string,
   opts: { model?: string; maxTokens?: number } = {},
 ): Promise<string> {
-  const res = (await ai.run(opts.model ?? SYNTH_MODEL, {
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: user },
-    ],
-    temperature: 0.4,
-    max_tokens: opts.maxTokens ?? 700,
-  })) as unknown as ChatResponse;
-  return (res.response ?? '').trim();
+  const model = opts.model ?? SYNTH_MODEL;
+  const t0 = Date.now();
+  try {
+    const res = (await ai.run(model, {
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      temperature: 0.4,
+      max_tokens: opts.maxTokens ?? 700,
+    })) as unknown as ChatResponse;
+    const ms = Date.now() - t0;
+    if (ms > 5000) console.log('synth:slow', { model, ms });
+    return (res.response ?? '').trim();
+  } catch (e) {
+    const ms = Date.now() - t0;
+    console.error('synth:error', { model, ms, error: String(e) });
+    throw e;
+  }
 }

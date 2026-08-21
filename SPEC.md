@@ -46,7 +46,7 @@ Reactive (in-conversation), ported from Glopus `memory-tools.ts` with descriptio
 - `recall(query)` — raw observations + summaries, similarity + recency weighted, no synthesis. The receipt path.
 - `load_memory(topics_or_questions[])` — **short args, not the full user message.** Returns recency-first recent observations (token-capped) + matched model views + observation RAG. Agent-as-router: the agent picks topics from the model index.
 
-Maintenance (in v1 — the agent is trusted to manage these): `archive_model`, `rename_model`, `fold` (record a synthesis observation into the parent, then archive the child). Guarded only by protecting the five seed models `self/user/system/world/memory` from archive/rename. No separate cron agent — `record_observation` returns a **defrag hint** when the fragmentation metric crosses threshold, and the agent acts on it in-conversation.
+Introspection: `memory_stats` (read-only counts + text-size distribution of observations and summaries; the same numbers ship on the token-gated `/admin/stats` endpoint). Maintenance (in v1 — the agent is trusted to manage these): `archive_model`, `rename_model`, `fold` (record a synthesis observation into the parent, then archive the child). Guarded only by protecting the five seed models `self/user/system/world/memory` from archive/rename. No separate cron agent — `record_observation` returns a **defrag hint** when the fragmentation metric crosses threshold, and the agent acts on it in-conversation.
 
 ## load_memory & conversation-start loading
 

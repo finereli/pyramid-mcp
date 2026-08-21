@@ -83,8 +83,7 @@ const TOOLS: ToolDef[] = [
         return `Unknown model name(s): ${res.unknown.join(', ')}. Call create_model first, or pick existing names from the model index.`;
       }
       if (res.deduped) return 'Skipped as duplicate of a recent observation.';
-      // Resummarize trigger — no-op unless a tagged model crossed its threshold.
-      try { await memory.maybeResummarize(res.tagged); } catch { /* never fail recording on synthesis */ }
+      memory.background(memory.maybeResummarize(res.tagged));
       let out = `Recorded against: ${res.tagged.join(', ')}.`;
       // Defrag hint — nudge the agent to declutter when the index fragments.
       const frag = memory.computeFragmentation();
@@ -239,7 +238,11 @@ const TOOLS: ToolDef[] = [
         if (model) {
           const conf = memory.getModelConfidence(model.id);
           const summaries = memory.listSummariesForModel(model.id);
-          const obs = memory.listObservationsForModel(model.id, MODEL_VIEW_OBS);
+          // Verbatim notes show only the unsummarized tail — everything up to
+          // the latest summary's end already lives in the tier summaries, and
+          // repeating it verbatim would defeat the pyramid's compression.
+          const summarizedUntil = summaries.reduce((mx, s) => Math.max(mx, s.endTimestamp), 0);
+          const obs = memory.listObservationsForModel(model.id, MODEL_VIEW_OBS, summarizedUntil);
           views.push(formatModelView(model, conf, summaries, obs));
         } else {
           ragTopics.push(t);
@@ -247,13 +250,12 @@ const TOOLS: ToolDef[] = [
       }
       if (views.length > 0) blocks.push(`# Loaded models\n\n${views.join('\n\n')}`);
 
-      // Free-text topics → observation RAG (embeds each via Workers AI).
       if (ragTopics.length > 0) {
         try {
+          const vecs = await memory.embedMany(ragTopics);
           const seen = new Set<string>();
           const receipts = [] as ReturnType<MemoryDO['searchObservations']>;
-          for (const q of ragTopics) {
-            const qv = await memory.embed(q);
+          for (const qv of vecs) {
             for (const m of memory.searchObservations(qv, RAG_PER_TOPIC, 0.3)) {
               if (!seen.has(m.id)) { seen.add(m.id); receipts.push(m); }
             }
@@ -268,6 +270,13 @@ const TOOLS: ToolDef[] = [
 
       return blocks.filter(Boolean).join('\n\n');
     },
+  },
+  {
+    name: 'memory_stats',
+    description:
+      'Size and shape of this memory store: counts of models, observations, and summaries, plus the text-length distribution of observations and summaries (min/max/mean/median/total chars, with a chars/4 token estimate). Read-only. Use when asked how big memory is, or to sanity-check growth.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async (memory) => formatStats(memory.getStats()),
   },
 ];
 
@@ -316,11 +325,16 @@ async function dispatch(memory: MemoryDO, req: JsonRpcRequest): Promise<object |
       const args = (req.params?.arguments as Record<string, unknown>) ?? {};
       const tool = TOOLS_BY_NAME.get(name);
       if (!tool) return rpcError(req.id, -32602, `Unknown tool: ${name}`);
+      const t0 = Date.now();
       try {
         const text = await tool.handler(memory, args);
+        const ms = Date.now() - t0;
+        if (ms > 2000) console.log('tool:slow', { tool: name, ms });
         return rpcResult(req.id, { content: [{ type: 'text', text }] });
       } catch (e) {
+        const ms = Date.now() - t0;
         const message = e instanceof Error ? e.message : String(e);
+        console.error('tool:error', { tool: name, ms, error: message, stack: e instanceof Error ? e.stack : undefined });
         return rpcResult(req.id, { content: [{ type: 'text', text: `Tool error: ${message}` }], isError: true });
       }
     }
@@ -355,4 +369,27 @@ export async function handleMcpRequest(memory: MemoryDO, request: Request): Prom
 
   const response = await dispatch(memory, body as JsonRpcRequest);
   return response === null ? new Response(null, { status: 202 }) : Response.json(response);
+}
+
+function formatStats(st: ReturnType<MemoryDO['getStats']>): string {
+  const row = (label: string, z: { count: number; minChars: number; maxChars: number; meanChars: number; medianChars: number; totalChars: number; minTokens: number; maxTokens: number; meanTokens: number; medianTokens: number; totalTokens: number }) =>
+    `${label} (${z.count}): min ${z.minChars} chars / ~${z.minTokens} tok · max ${z.maxChars} / ~${z.maxTokens} · mean ${z.meanChars} / ~${z.meanTokens} · median ${z.medianChars} / ~${z.medianTokens} · total ${z.totalChars} / ~${z.totalTokens}`;
+  return [
+    `Models: ${st.models} active · Observations: ${st.observations} (${st.embedded} embedded, dim ${st.embeddingDim}) · Summaries: ${st.summaries}`,
+    row('Observations', st.observationSize),
+    row('Summaries', st.summarySize),
+    '(tokens ≈ chars / 4)',
+    '',
+    'Per model (biggest first): obs · obs chars/~tok · mean obs chars · summaries (top tier) · summary chars/~tok · span',
+    ...st.perModel.map(m => {
+      const flags = [m.seed ? 'seed' : '', m.archived ? 'archived' : ''].filter(Boolean).join(', ');
+      const span = m.earliest && m.latest ? `${day(m.earliest)} → ${day(m.latest)}` : 'no observations';
+      const tier = m.summaries ? ` (tier ${m.topTier})` : '';
+      return `- ${m.name}${flags ? ` [${flags}]` : ''}: ${m.observations} obs · ${m.observationChars}/~${m.observationTokens} · mean ${m.meanObservationChars} · ${m.summaries} sum${tier} · ${m.summaryChars}/~${m.summaryTokens} · ${span}`;
+    }),
+  ].join('\n');
+}
+
+function day(ts: number): string {
+  return new Date(ts).toISOString().slice(0, 10);
 }
