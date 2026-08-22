@@ -202,6 +202,26 @@ describe('pyramid — exact-once provenance, rollups, immutability (stub synthes
     expect((await u.listTailForModel(m.id, 15)).length).toBe(5);
   });
 
+  it('carries transitive provenance stats (obs_count, source_chars) up through rollups', async () => {
+    const { u, m } = await seeded(55);
+    await u.advancePyramid(m.id);
+    const all = await u.listAllSummariesForModel(m.id);
+    const t0 = all.filter(s => s.tier === 0);
+    // Each tier-0: 10 observations, chars = sum of their text lengths.
+    for (const s of t0) {
+      expect(s.obsCount).toBe(10);
+      expect(s.sourceChars).toBeGreaterThan(0);
+    }
+    // The tier-1 rollup sums its children: 50 raw observations behind it, chars = sum of the tier-0 sourceChars.
+    const t1 = all.filter(s => s.tier === 1)[0]!;
+    expect(t1.obsCount).toBe(50);
+    expect(t1.sourceChars).toBe(t0.reduce((n, s) => n + (s.sourceChars ?? 0), 0));
+    // And recall exposes the transitive count on summary matches.
+    await u.setSummaryEmbedding(t1.id, [1, 0, 0, 0]);
+    const hit = (await u.searchObservations([1, 0, 0, 0], 5, 0)).find(h => h.kind === 'summary' && h.id === t1.id);
+    expect(hit?.obsCount).toBe(50);
+  });
+
   it('is incremental and immutable: advancing again never rewrites existing summaries', async () => {
     const { u, m } = await seeded(12);
     await u.advancePyramid(m.id);

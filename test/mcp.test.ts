@@ -39,6 +39,8 @@ describe('MCP transport over /mcp', () => {
     expect(json.result.instructions).toContain('long-term memory');
     expect(json.result.instructions).toContain('record_observation');
     expect(json.result.instructions).toContain('active recollection'); // effortful-recall reinforcement nudge
+    expect(json.result.instructions).toContain('deeper the compression'); // confidence legend for summary labels
+    expect(json.result.instructions).toContain('cheap next time'); // recall-struggle recording nudge
   });
 
   it('notifications/initialized is a 202 with no body', async () => {
@@ -165,7 +167,7 @@ describe('MCP — pyramid growth through the tools', () => {
     }
     const res = await rpc(u, { jsonrpc: '2.0', id: 82, method: 'tools/call', params: { name: 'load_memory', arguments: { topics: ['proj'] } } });
     const text = ((await res.json()) as RpcResponse).result.content[0].text as string;
-    expect(text).toMatch(/\[tier 0 · 10 obs · \d{4}-\d{2}-\d{2}–\d{4}-\d{2}-\d{2}\]/); // cover label
+    expect(text).toMatch(/\[tier 0 · 10 obs · [\d.]+K?→[\d.]+K? chars · \d{4}-\d{2}-\d{2}–\d{4}-\d{2}-\d{2}/); // cover label: transitive obs count + compression
     expect(text).toContain('[stub tier0 tier 0 · 10 sources');                       // the summary text
     expect(text).toContain('note number 10 about');                                     // tail verbatim
     expect(text).toContain('note number 11 about');

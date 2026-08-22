@@ -64,6 +64,10 @@ export interface SummaryRow {
   startTimestamp: number;
   endTimestamp: number;
   sourceCount: number;
+  /** Transitive: raw observations behind this summary through all tiers below. */
+  obsCount?: number;
+  /** Transitive: total chars of those raw observations — the numerator of the compression ratio. */
+  sourceChars?: number;
   /** Set on view rows only: this summary is already rolled into a higher tier shown above (resolution ramp). */
   covered?: boolean;
 }
@@ -80,6 +84,7 @@ export interface ObservationMatch {
   kind: 'observation' | 'summary';
   tier?: number;         // summaries only
   startTimestamp?: number; // summaries only
+  obsCount?: number;     // summaries only: transitive raw observations behind the arc
 }
 
 export interface SummarySource { type: 'observation' | 'summary'; id: string }
@@ -169,11 +174,42 @@ export class MemoryDO extends DurableObject<Env> {
     // Add columns introduced after the initial schema, for DOs created earlier.
     try { this.sql.exec('ALTER TABLE models ADD COLUMN last_summarized_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already present */ }
     try { this.sql.exec('ALTER TABLE summaries ADD COLUMN embedding BLOB'); } catch { /* already present */ }
+    try { this.sql.exec('ALTER TABLE summaries ADD COLUMN obs_count INTEGER'); } catch { /* already present */ }
+    try { this.sql.exec('ALTER TABLE summaries ADD COLUMN source_chars INTEGER'); } catch { /* already present */ }
     // Migration from the time-window pyramid (pre Aug 2026): a summary without
     // provenance rows is invalid in this design — nothing can be covered by it
     // and nothing can roll it up. Drop any such rows; the pyramid regrows
     // incrementally from the observations. Idempotent and cheap.
     this.sql.exec('DELETE FROM summaries WHERE NOT EXISTS (SELECT 1 FROM summary_sources ss WHERE ss.summary_id = summaries.id)');
+    this.backfillProvenanceStats();
+  }
+
+  /**
+   * One-time backfill of the transitive provenance stats (obs_count,
+   * source_chars) for summaries created before those columns existed. Tier 0
+   * counts straight from summary_sources; higher tiers sum their children, so
+   * the walk goes tier-ascending. New summaries get the values at insert;
+   * re-running touches nothing (obs_count IS NULL filter). Cheap and idempotent.
+   */
+  private backfillProvenanceStats(): void {
+    const missing = (this.sql.exec('SELECT COUNT(*) AS c FROM summaries WHERE obs_count IS NULL').one() as { c: number }).c;
+    if (missing === 0) return;
+    this.sql.exec(
+      `UPDATE summaries SET
+         obs_count = (SELECT COUNT(*) FROM summary_sources ss WHERE ss.summary_id = summaries.id),
+         source_chars = (SELECT COALESCE(SUM(LENGTH(o.text)), 0) FROM summary_sources ss JOIN observations o ON o.id = ss.source_id WHERE ss.summary_id = summaries.id)
+       WHERE tier = 0 AND obs_count IS NULL`,
+    );
+    const maxTier = (this.sql.exec('SELECT COALESCE(MAX(tier), 0) AS t FROM summaries').one() as { t: number }).t;
+    for (let tier = 1; tier <= maxTier; tier++) {
+      this.sql.exec(
+        `UPDATE summaries SET
+           obs_count = (SELECT COALESCE(SUM(c.obs_count), 0) FROM summary_sources ss JOIN summaries c ON c.id = ss.source_id WHERE ss.summary_id = summaries.id),
+           source_chars = (SELECT COALESCE(SUM(c.source_chars), 0) FROM summary_sources ss JOIN summaries c ON c.id = ss.source_id WHERE ss.summary_id = summaries.id)
+         WHERE tier = ? AND obs_count IS NULL`,
+        tier,
+      );
+    }
   }
 
   private getConfig(key: string): string | undefined {
@@ -413,10 +449,10 @@ export class MemoryDO extends DurableObject<Env> {
       // Arcs, not just receipts: summaries are searchable too. Recency uses the
       // summary's end timestamp — the newest material it covers.
       const sums = this.sql
-        .exec('SELECT id, text, tier, start_timestamp, end_timestamp, embedding FROM summaries WHERE embedding IS NOT NULL')
-        .toArray() as Array<{ id: string; text: string; tier: number; start_timestamp: number; end_timestamp: number; embedding: ArrayBuffer }>;
+        .exec('SELECT id, text, tier, start_timestamp, end_timestamp, obs_count, embedding FROM summaries WHERE embedding IS NOT NULL')
+        .toArray() as Array<{ id: string; text: string; tier: number; start_timestamp: number; end_timestamp: number; obs_count: number | null; embedding: ArrayBuffer }>;
       for (const s of sums) {
-        scored.push({ id: s.id, text: s.text, timestamp: s.end_timestamp, score: score(s.embedding, s.end_timestamp), kind: 'summary', tier: s.tier, startTimestamp: s.start_timestamp });
+        scored.push({ id: s.id, text: s.text, timestamp: s.end_timestamp, score: score(s.embedding, s.end_timestamp), kind: 'summary', tier: s.tier, startTimestamp: s.start_timestamp, obsCount: s.obs_count ?? undefined });
       }
     }
     scored.sort((a, b) => a.score - b.score);
@@ -460,7 +496,7 @@ export class MemoryDO extends DurableObject<Env> {
    */
   listSummariesForModel(modelId: string): SummaryRow[] {
     const cover = this.sql.exec(
-      `SELECT s.id, s.tier, s.text, s.start_timestamp, s.end_timestamp, s.source_count
+      `SELECT s.id, s.tier, s.text, s.start_timestamp, s.end_timestamp, s.source_count, s.obs_count, s.source_chars
        FROM summaries s
        WHERE s.model_id = ?
          AND NOT EXISTS (SELECT 1 FROM summary_sources up WHERE up.source_type = 'summary' AND up.source_id = s.id)
@@ -473,7 +509,7 @@ export class MemoryDO extends DurableObject<Env> {
   /** Every summary of a model, all tiers, whether or not rolled up. For export and stats. */
   listAllSummariesForModel(modelId: string): SummaryRow[] {
     const rows = this.sql.exec(
-      `SELECT id, tier, text, start_timestamp, end_timestamp, source_count FROM summaries WHERE model_id = ? ORDER BY tier ASC, start_timestamp ASC`,
+      `SELECT id, tier, text, start_timestamp, end_timestamp, source_count, obs_count, source_chars FROM summaries WHERE model_id = ? ORDER BY tier ASC, start_timestamp ASC`,
       modelId,
     ).toArray() as Array<Record<string, unknown>>;
     return rows.map(toSummaryRow);
@@ -510,7 +546,7 @@ export class MemoryDO extends DurableObject<Env> {
   /** Tier-N summaries of the model not yet rolled into tier N+1. Oldest first. */
   unrolledSummaries(modelId: string, tier: number): SummaryRow[] {
     const rows = this.sql.exec(
-      `SELECT s.id, s.tier, s.text, s.start_timestamp, s.end_timestamp, s.source_count
+      `SELECT s.id, s.tier, s.text, s.start_timestamp, s.end_timestamp, s.source_count, s.obs_count, s.source_chars
        FROM summaries s
        WHERE s.model_id = ? AND s.tier = ?
          AND NOT EXISTS (SELECT 1 FROM summary_sources up WHERE up.source_type = 'summary' AND up.source_id = s.id)
@@ -542,7 +578,7 @@ export class MemoryDO extends DurableObject<Env> {
     const summaries: SummaryRow[] = [...cover];
     for (let tier = 0; tier < top; tier++) {
       const rows = this.sql.exec(
-        `SELECT s.id, s.tier, s.text, s.start_timestamp, s.end_timestamp, s.source_count
+        `SELECT s.id, s.tier, s.text, s.start_timestamp, s.end_timestamp, s.source_count, s.obs_count, s.source_chars
          FROM summaries s
          WHERE s.model_id = ? AND s.tier = ?
            AND EXISTS (SELECT 1 FROM summary_sources up WHERE up.source_type = 'summary' AND up.source_id = s.id)
@@ -586,9 +622,25 @@ export class MemoryDO extends DurableObject<Env> {
       try { blob = floatsToBlob(normalizeVec(await this.embed(s.text))); }
       catch (e) { console.error('[insertSummary] embed failed, storing without vector:', e); }
     }
+    // Transitive provenance stats: raw observations (and their chars) behind
+    // this summary through all tiers. Summaries are immutable, so compute once.
+    const ids = sources.map(src => src.id);
+    let obsCount = sources.length;
+    let sourceChars = 0;
+    if (sources[0]!.type === 'observation') {
+      sourceChars = (this.sql.exec(
+        `SELECT COALESCE(SUM(LENGTH(text)), 0) AS c FROM observations WHERE id IN (${placeholders(ids.length)})`, ...ids,
+      ).one() as { c: number }).c;
+    } else {
+      const row = this.sql.exec(
+        `SELECT COALESCE(SUM(obs_count), 0) AS n, COALESCE(SUM(source_chars), 0) AS c FROM summaries WHERE id IN (${placeholders(ids.length)})`, ...ids,
+      ).one() as { n: number; c: number };
+      obsCount = row.n;
+      sourceChars = row.c;
+    }
     this.sql.exec(
-      'INSERT INTO summaries (id, model_id, tier, text, start_timestamp, end_timestamp, source_count, is_dirty, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)',
-      id, modelId, s.tier, s.text, s.startTimestamp, s.endTimestamp, s.sourceCount, blob,
+      'INSERT INTO summaries (id, model_id, tier, text, start_timestamp, end_timestamp, source_count, is_dirty, embedding, obs_count, source_chars) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)',
+      id, modelId, s.tier, s.text, s.startTimestamp, s.endTimestamp, s.sourceCount, blob, obsCount, sourceChars,
     );
     for (const src of sources) {
       this.sql.exec('INSERT OR IGNORE INTO summary_sources (summary_id, source_type, source_id) VALUES (?, ?, ?)', id, src.type, src.id);
@@ -961,6 +1013,8 @@ function toSummaryRow(r: Record<string, unknown>): SummaryRow {
     startTimestamp: r.start_timestamp as number,
     endTimestamp: r.end_timestamp as number,
     sourceCount: r.source_count as number,
+    obsCount: (r.obs_count as number | null) ?? undefined,
+    sourceChars: (r.source_chars as number | null) ?? undefined,
   };
 }
 

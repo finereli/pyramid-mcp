@@ -36,11 +36,11 @@ At the START of a conversation, call \`load_memory\` with the topics or question
 
 As the conversation unfolds, call \`record_observation\` for anything you might even remotely need to remember in a future conversation. Anything you don't record will be forgotten. Write in your own voice, like a diary — capture what mattered, what shifted, specific facts. Tag each observation with one or more models from the model index; call \`create_model\` when a genuinely new person, project, or topic emerges.
 
-Use \`recall\` to verify specific facts (names, dates, numbers, quotes) before stating them.
+Use \`recall\` to verify specific facts (names, dates, numbers, quotes) before stating them. When a fact takes real effort to find — recall misses it, it needs several queries, or the user has to supply it — record it as a fresh observation once confirmed, so it's cheap next time.
 
 Recording isn't only for fresh facts from the conversation. When something interesting surfaces — and especially when you reconstruct something from your own memory that you couldn't easily recall at first — it deserves an observation. The moment to write it is when a fuller picture finally coheres, which is often only after the user pushes past your first thin answer: capture that synthesis, and note that it was hard-won through active recollection. Skip the first shallow grab (it's noise); record the version that actually came together. Use your judgment on what counts as interesting — the point is that effortful reconstructions become cheap next time, and the threads the user keeps returning to get reinforced.
 
-Bracketed metadata like \`[client-cristi · 12 obs · spans 3mo · latest 2026-05-20]\` tells you how much backs a memory and how fresh it is — calibrate your confidence accordingly. Never mention models, clusters, or that memory was "loaded"; weave recollections in as your own knowing.`;
+Bracketed metadata like \`[client-cristi · 12 obs · spans 3mo · latest 2026-05-20]\` tells you how much backs a memory and how fresh it is — calibrate your confidence accordingly. Summary labels like \`[tier 2 · 47 obs · 61K→1.0K chars · 2026-03-01–2026-06-05]\` show how many raw observations stand behind an arc and how hard they were compressed: the deeper the compression, the more a specific claim from that summary deserves a \`recall\` check before you state it as fact. Never mention models, clusters, or that memory was "loaded"; weave recollections in as your own knowing.`;
 
 // ---------- Tool definitions ----------
 
@@ -195,7 +195,7 @@ const TOOLS: ToolDef[] = [
   {
     name: 'recall',
     description:
-      'Search memory for specific facts, details, or context. Use this to verify names, dates, numbers, client details, or any specific information before stating it as fact — and to fill in anything a loaded model view left out. Returns raw matches (most relevant first, recency-weighted): observations are receipts, summaries (labeled with their date range and tier) are arcs. Synthesize them yourself rather than echoing them verbatim.',
+      'Search memory for specific facts, details, or context. Use this to verify names, dates, numbers, client details, or any specific information before stating it as fact — and to fill in anything a loaded model view left out. Returns raw matches (most relevant first, recency-weighted): observations are receipts, summaries (labeled with their date range, tier, and how many raw observations stand behind them) are arcs. Synthesize them yourself rather than echoing them verbatim. If a fact takes real effort to find — it is not here, needs several queries, or has to be re-derived or supplied by the user — record it as a fresh observation once confirmed, so the next recall is cheap.',
     inputSchema: {
       type: 'object',
       properties: {

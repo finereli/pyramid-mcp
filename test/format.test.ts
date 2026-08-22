@@ -5,6 +5,7 @@ import {
   formatRecentNotes,
   formatModelIndex,
   formatModelView,
+  timeLabel,
 } from '../src/format.js';
 import type { ModelRow, ObservationRow, ObservationMatch } from '../src/memory-do.js';
 
@@ -38,14 +39,31 @@ describe('formatRecentNotes', () => {
   });
 });
 
-describe('formatRecall', () => {
-  it('numbers and dates matches', () => {
-    const m: ObservationMatch[] = [{ id: 'a', text: 'closed at $4k', timestamp: NOW, score: 0.1, kind: 'observation' }];
-    expect(formatRecall(m)).toBe('[1] [2026-05-30] closed at $4k');
+describe('timeLabel', () => {
+  it('renders the recent past as timezone-free durations', () => {
+    expect(timeLabel(NOW - 30_000, NOW)).toBe('just now');
+    expect(timeLabel(NOW - 5 * 60_000, NOW)).toBe('5m ago');
+    expect(timeLabel(NOW - 2 * 3_600_000, NOW)).toBe('2h ago');
+    expect(timeLabel(NOW - 26 * 3_600_000, NOW)).toBe('26h ago'); // never "yesterday" — the server has no timezone
   });
-  it('labels summaries with their range and tier', () => {
-    const m: ObservationMatch[] = [{ id: 's', text: 'the arc', timestamp: NOW, startTimestamp: NOW - 10 * DAY, score: 0.2, kind: 'summary', tier: 1 }];
-    expect(formatRecall(m)).toBe('[1] [2026-05-20–2026-05-30 · summary tier 1] the arc');
+  it('renders days with a date anchor, then plain ISO', () => {
+    expect(timeLabel(NOW - 3 * DAY, NOW)).toBe('2026-05-27 · 3d ago');
+    expect(timeLabel(NOW - 20 * DAY, NOW)).toBe('2026-05-10');
+  });
+});
+
+describe('formatRecall', () => {
+  it('numbers matches, recent observations as relative times', () => {
+    const m: ObservationMatch[] = [{ id: 'a', text: 'closed at $4k', timestamp: NOW - 2 * 3_600_000, score: 0.1, kind: 'observation' }];
+    expect(formatRecall(m, NOW)).toBe('[1] [2h ago] closed at $4k');
+  });
+  it('dates older observations', () => {
+    const m: ObservationMatch[] = [{ id: 'a', text: 'closed at $4k', timestamp: NOW - 20 * DAY, score: 0.1, kind: 'observation' }];
+    expect(formatRecall(m, NOW)).toBe('[1] [2026-05-10] closed at $4k');
+  });
+  it('labels summaries with their range, tier, and transitive obs count', () => {
+    const m: ObservationMatch[] = [{ id: 's', text: 'the arc', timestamp: NOW, startTimestamp: NOW - 10 * DAY, score: 0.2, kind: 'summary', tier: 1, obsCount: 47 }];
+    expect(formatRecall(m, NOW)).toBe('[1] [2026-05-20–2026-05-30 · summary tier 1 · 47 obs] the arc');
   });
   it('handles no matches', () => {
     expect(formatRecall([])).toBe('No relevant memories found.');
@@ -64,18 +82,30 @@ describe('formatModelIndex / formatModelView', () => {
       model,
       { obsCount: 30, earliest: NOW - 40 * DAY, latest: NOW },
       [
-        { id: 's1', tier: 1, text: 'old arc', startTimestamp: NOW - 40 * DAY, endTimestamp: NOW - 20 * DAY, sourceCount: 5 },
+        // With transitive stats: obs count + compression ratio in the label.
+        { id: 's1', tier: 1, text: 'old arc', startTimestamp: NOW - 40 * DAY, endTimestamp: NOW - 20 * DAY, sourceCount: 5, obsCount: 47, sourceChars: 61_200 },
+        // Without them (pre-backfill row): falls back to the immediate source count.
         { id: 's0', tier: 0, text: 'recent batch', startTimestamp: NOW - 19 * DAY, endTimestamp: NOW - 2 * DAY, sourceCount: 10 },
       ],
       [{ id: 'o1', text: 'fresh note', timestamp: NOW, source: 'direct' }],
       NOW,
     );
-    const i1 = out.indexOf('[tier 1 · 5 tier-0 summaries · 2026-04-20–2026-05-10]\nold arc');
+    const i1 = out.indexOf('[tier 1 · 47 obs · 61K→7 chars · 2026-04-20–2026-05-10]\nold arc');
     const i0 = out.indexOf('[tier 0 · 10 obs · 2026-05-11–2026-05-28]\nrecent batch');
-    const it = out.indexOf('Recent notes (verbatim):\n- [2026-05-30] fresh note');
+    const it = out.indexOf('Recent notes (verbatim):\n- [just now] fresh note');
     expect(i1).toBeGreaterThan(0);
     expect(i0).toBeGreaterThan(i1);
     expect(it).toBeGreaterThan(i0);
+  });
+  it('marks a summary that ended within the last 48h', () => {
+    const out = formatModelView(
+      model,
+      { obsCount: 10, earliest: NOW - 5 * DAY, latest: NOW },
+      [{ id: 's0', tier: 0, text: 'hot batch', startTimestamp: NOW - 5 * DAY, endTimestamp: NOW - 3 * 3_600_000, sourceCount: 10, obsCount: 10, sourceChars: 4_000 }],
+      [],
+      NOW,
+    );
+    expect(out).toContain('[tier 0 · 10 obs · 4.0K→9 chars · 2026-05-25–2026-05-29 · ended 3h ago]');
   });
   it('renders a view with confidence + verbatim notes', () => {
     const out = formatModelView(
