@@ -69,6 +69,7 @@ describe('prompts', () => {
     expect(job.user).toContain(`~${targetCharsForTier(0)}-character`);
     expect(job.system).toContain('date ranges');
     expect(job.system).toContain('never invent');
+    expect(job.system).toContain('of the N noted'); // recurrence → explicit counts, scoped to the record
     expect(job.sourceIds).toEqual(batch.map(o => o.id));
     expect(job.startTs).toBeLessThan(job.endTs);
     expect(job.maxTokens).toBe(ceilingTokensForTier(0));
@@ -82,6 +83,7 @@ describe('prompts', () => {
     expect(job.user).toContain('tier-1 summaries');
     expect(job.user).toContain('child 0');
     expect(job.user).toContain(`~${targetCharsForTier(2)}-character`);
+    expect(job.system).toContain('only be summed from explicit counts'); // no numbers from vague quantifiers
     expect(job.sourceIds.length).toBe(5);
     expect(job.startTs).toBe(kids[0]!.startTimestamp);
     expect(job.endTs).toBe(kids[4]!.endTimestamp);

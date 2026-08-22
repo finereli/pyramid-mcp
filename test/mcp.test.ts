@@ -41,6 +41,7 @@ describe('MCP transport over /mcp', () => {
     expect(json.result.instructions).toContain('active recollection'); // effortful-recall reinforcement nudge
     expect(json.result.instructions).toContain('deeper the compression'); // confidence legend for summary labels
     expect(json.result.instructions).toContain('cheap next time'); // recall-struggle recording nudge
+    expect(json.result.instructions).toContain('enumerate the specific dated notes'); // no counting by vibes
   });
 
   it('notifications/initialized is a 202 with no body', async () => {

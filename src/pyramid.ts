@@ -87,6 +87,7 @@ const COMMON_RULES = `Rules that apply at every tier:
 - Factual discipline: never invent a number, name, date, or relationship that is not in the material. An omission is correct; a confabulation corrupts everything built on top of this.
 - Hold to the target length. Use it fully when the material is rich - ten substantive observations deserve the whole budget, and leaving specifics out to come in short is a loss, not a virtue. Shorter is fine only when the material is genuinely thin.
 - Prefer concrete events, decisions, numbers, and names over characterizations. "Decided on May 10 to sell the house" beats "navigated major life decisions"; "closed Cristi at $4K/mo + 10%" beats "made progress on partnerships". At higher tiers this matters most: compress by dropping lesser events, not by turning events into adjectives.
+- Recurrence is data: when the same kind of event recurs in the material, state the count and its window — "bad sleep on 4 of the 6 nights noted (Aug 12–17)" beats "a stretch of poor sleep". Count only what is in front of you, and say "of the N noted" — the count is of the record, not of reality.
 - Output ONLY the summary prose. No preamble, no headers, no closing line that sums up "overall" or speculates about the future.`;
 
 export const TIER0_SYSTEM = `You are the compression step in a pyramid memory system. You compress a batch of raw observations into one tier-0 summary for a SINGLE mental model.
@@ -98,6 +99,8 @@ ${COMMON_RULES}`;
 export const ROLLUP_SYSTEM = `You are the compression step in a pyramid memory system. You compress several summaries that were already written through a SINGLE mental model's lens into one summary one tier up.
 
 The input summaries are preserved separately and stay searchable — you are building a more compact representation, not an archive. Merge patterns across the periods, consolidate repeats, keep what is genuinely distinct and load-bearing. Some batches have one unifying thread — compress hard around it. Others span different facets of the lens — keep the breadth. Use your judgment.
+
+Counts of recurring events may only be summed from explicit counts in your inputs — "4 of 6 nights" plus "3 of 5 nights" is "7 of 11 nights noted". If an input says "several" or "often", you do not have a number; keep the vague word rather than inventing one.
 
 ${COMMON_RULES}`;
 
