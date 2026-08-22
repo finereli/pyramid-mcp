@@ -39,7 +39,7 @@ The pitch above is the experience; this is the machinery.
 - **No keys to bring.** Embeddings (`bge-m3`) and synthesis (Llama 3.3 70B) run on Cloudflare Workers AI, billed to your account. (Synthesis is provider-agnostic so it can move to MCP sampling - the host's own model - once clients support it.)
 - **Speaks MCP over Streamable HTTP.** Any MCP-capable client - Claude, ChatGPT, your own - connects the same way.
 
-This is the memory architecture proven inside [Glopus](https://glopus.finereli.com), repackaged so any MCP-capable backend can plug into it. See **[SPEC.md](./SPEC.md)** for the full design.
+This is the memory architecture proven inside Glopus (a private, heavily used agent harness where this design first ran), repackaged so any MCP-capable backend can plug into it. See **[SPEC.md](./SPEC.md)** for the full design.
 
 ## Claude Code integration
 

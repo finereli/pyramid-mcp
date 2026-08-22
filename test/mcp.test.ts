@@ -109,6 +109,21 @@ describe('MCP transport over /mcp', () => {
     expect(text).not.toContain('no embedding key');
   });
 
+  it('load_memory remembers a valid timezone and ignores an invalid one', async () => {
+    const u = user();
+    const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(u));
+    await rpc(u, { jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'load_memory', arguments: { topics: [], timezone: 'Asia/Jerusalem' } } });
+    expect(await stub.getTimezone()).toBe('Asia/Jerusalem');
+    // An invalid name is rejected at set time; the stored one survives.
+    await rpc(u, { jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'load_memory', arguments: { topics: [], timezone: 'Not/AZone' } } });
+    expect(await stub.getTimezone()).toBe('Asia/Jerusalem');
+    // Recent notes render local-day labels once the timezone is known.
+    await rpc(u, { jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'a freshly recorded note about timezones', models: ['user'] } } });
+    const res = await rpc(u, { jsonrpc: '2.0', id: 23, method: 'tools/call', params: { name: 'load_memory', arguments: { topics: [] } } });
+    const text = ((await res.json()) as RpcResponse).result.content[0].text as string;
+    expect(text).toMatch(/- \[just now\] a freshly recorded note/);
+  });
+
   it('load_memory returns the index, recent notes, and a matched model view', async () => {
     const u = user();
     await rpc(u, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'create_model', arguments: { name: 'coaching', description: 'coaching practice' } } });

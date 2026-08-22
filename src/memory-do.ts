@@ -236,6 +236,21 @@ export class MemoryDO extends DurableObject<Env> {
     return synthesize(this.env.AI, job.system, job.user, { maxTokens: job.maxTokens });
   }
 
+  /**
+   * Remember the user's IANA timezone for render-time labels ("today 14:30" /
+   * "yesterday"), supplied by the host agent via load_memory. Validated here so
+   * an invalid name never enters config. Returns whether it was accepted.
+   */
+  setTimezone(tz: string): boolean {
+    try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch { return false; }
+    this.setConfig('timezone', tz);
+    return true;
+  }
+
+  getTimezone(): string | undefined {
+    return this.getConfig('timezone');
+  }
+
   private ensureSeedModels(): void {
     const count = this.sql.exec('SELECT COUNT(*) AS c FROM models').one().c as number;
     if (count > 0) return; // already seeded (or migrated) — don't re-create

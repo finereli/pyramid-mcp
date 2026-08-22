@@ -88,7 +88,7 @@ const LANDING_HTML = `<!doctype html>
   <footer>
     <a href="https://github.com/finereli/pyramid-mcp">Source on GitHub</a> &nbsp;&middot;&nbsp;
     <a href="https://github.com/finereli/pyramid-mcp/blob/main/SETUP.md">Run your own</a> &nbsp;&middot;&nbsp;
-    the memory architecture behind <a href="https://glopus.finereli.com">Glopus</a>
+    a memory architecture proven in daily agent use
   </footer>
 </main>
 </body>

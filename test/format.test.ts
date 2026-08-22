@@ -50,6 +50,22 @@ describe('timeLabel', () => {
     expect(timeLabel(NOW - 3 * DAY, NOW)).toBe('2026-05-27 · 3d ago');
     expect(timeLabel(NOW - 20 * DAY, NOW)).toBe('2026-05-10');
   });
+  it('renders real local days when a timezone is known', () => {
+    // 22:00 UTC on May 30 = 01:00 May 31 in Jerusalem (UTC+3, IDT).
+    const now = Date.UTC(2026, 4, 30, 22, 0);
+    const tz = 'Asia/Jerusalem';
+    // 1h ago (21:00 UTC) is 00:00 local — same local day as "now": today.
+    expect(timeLabel(now - 3_600_000, now, tz)).toBe('today 00:00');
+    // 2h ago (20:00 UTC) is 23:00 May 30 local — the previous local day, even
+    // though only 2h passed. Without tz this is "2h ago"; with it, "yesterday".
+    expect(timeLabel(now - 2 * 3_600_000, now, tz)).toBe('yesterday 23:00');
+    expect(timeLabel(now - 2 * 3_600_000, now)).toBe('2h ago');
+    // Beyond two local days: local date + day count.
+    expect(timeLabel(now - 3 * DAY, now, tz)).toBe('2026-05-28 · 3d ago');
+  });
+  it('falls back to durations when the timezone is invalid', () => {
+    expect(timeLabel(NOW - 3 * 3_600_000, NOW, 'Not/AZone')).toBe('3h ago');
+  });
 });
 
 describe('formatRecall', () => {

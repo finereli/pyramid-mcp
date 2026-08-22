@@ -32,7 +32,7 @@ const SERVER_INFO = { name: 'pyramid-mcp', version: '0.0.1' };
  */
 export const SERVER_INSTRUCTIONS = `This server is your long-term memory.
 
-At the START of a conversation, call \`load_memory\` with the topics or questions relevant to what the user is raising — it returns the matching mental models plus recent notes.
+At the START of a conversation, call \`load_memory\` with the topics or questions relevant to what the user is raising — it returns the matching mental models plus recent notes. Include the user's IANA timezone if you know it; remembered times then read in their local day ("today 14:30", "yesterday") instead of durations.
 
 As the conversation unfolds, call \`record_observation\` for anything you might even remotely need to remember in a future conversation. Anything you don't record will be forgotten. Write in your own voice, like a diary — capture what mattered, what shifted, specific facts. Tag each observation with one or more models from the model index; call \`create_model\` when a genuinely new person, project, or topic emerges.
 
@@ -209,13 +209,13 @@ const TOOLS: ToolDef[] = [
       let qv: number[];
       try { qv = await memory.embed(query); }
       catch (e) { console.error('[recall] embed failed:', e); return 'Recall is temporarily unavailable (embedding error). Try again shortly.'; }
-      return formatRecall(memory.searchObservations(qv, RECALL_LIMIT, 0.3));
+      return formatRecall(memory.searchObservations(qv, RECALL_LIMIT, 0.3), Date.now(), memory.getTimezone());
     },
   },
   {
     name: 'load_memory',
     description:
-      'Load relevant memory at the start of a conversation (or whenever the topic shifts). Pass the topics, people, projects, or questions in play — short tags, not the whole user message. Returns the model index (so you can pull more), recency-first recent notes (continuity), the full view of any topic that matches a model, and specific receipts retrieved for free-text topics. Call this early.',
+      'Load relevant memory at the start of a conversation (or whenever the topic shifts). Pass the topics, people, projects, or questions in play — short tags, not the whole user message — plus the user\'s IANA timezone if you know it, so times in memory render in their local terms. Returns the model index (so you can pull more), recency-first recent notes (continuity), the full view of any topic that matches a model, and specific receipts retrieved for free-text topics. Call this early.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -224,17 +224,23 @@ const TOOLS: ToolDef[] = [
           items: { type: 'string' },
           description: 'Topics/people/projects/questions relevant now. Names matching the model index load that model\'s view; free-text topics drive receipt retrieval.',
         },
+        timezone: {
+          type: 'string',
+          description: 'The user\'s IANA timezone (e.g. "Asia/Jerusalem"), if known. Remembered across conversations; recent memories then render as "today 14:30" / "yesterday" in the user\'s local day instead of timezone-free durations.',
+        },
       },
       required: ['topics'],
     },
     handler: async (memory, args) => {
       const topics = Array.isArray(args.topics) ? args.topics.map(String).map(s => s.trim()).filter(Boolean) : [];
+      if (typeof args.timezone === 'string' && args.timezone.trim()) memory.setTimezone(args.timezone.trim());
+      const tz = memory.getTimezone();
       const models = memory.listModels();
       const byName = new Map(models.map(m => [m.name, m]));
 
       const blocks: string[] = [formatModelIndex(models)];
 
-      const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT));
+      const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT), undefined, Date.now(), tz);
       if (recent) blocks.push(`# Recent notes\n_Newest first — continuity across recent conversations._\n\n${recent}`);
 
       const ragTopics: string[] = [];
@@ -250,7 +256,7 @@ const TOOLS: ToolDef[] = [
           // at a batch boundary; a generous budget guards against a pathological model.
           const raw = memory.listViewForModel(model.id, { ramp: RAMP_PER_TIER, verbatim: RAMP_VERBATIM, tailLimit: MODEL_VIEW_OBS });
           const view = renderWithBudget(raw.summaries, raw.observations, MODEL_VIEW_BUDGET_CHARS);
-          views.push(formatModelView(model, conf, view.summaries, view.observations));
+          views.push(formatModelView(model, conf, view.summaries, view.observations, Date.now(), tz));
           loadedNames.push(model.name);
         } else {
           ragTopics.push(t);
@@ -272,7 +278,7 @@ const TOOLS: ToolDef[] = [
             }
           }
           receipts.sort((a, b) => a.score - b.score);
-          const block = formatReceipts(receipts.slice(0, 12));
+          const block = formatReceipts(receipts.slice(0, 12), Date.now(), tz);
           if (block) blocks.push(block);
         } catch (e) {
           console.error('[load_memory] rag embed failed:', e);
