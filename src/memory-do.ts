@@ -15,7 +15,7 @@ import { DurableObject } from 'cloudflare:workers';
 import { handleMcpRequest } from './mcp.js';
 import { synthesize } from './synth.js';
 import { embed, embedOne, EMBEDDING_DIM } from './embeddings.js';
-import { bucketObservations, buildSynthJob } from './pyramid.js';
+import { batchTier0, batchRollup, buildTier0Job, buildRollupJob, stubSynthesize, type SynthJob } from './pyramid.js';
 
 export interface Env {
   MEMORY_DO: DurableObjectNamespace<MemoryDO>;
@@ -53,6 +53,8 @@ export interface ObservationRow {
   text: string;
   timestamp: number;
   source: string;
+  /** Set on view rows only: this observation is already inside a tier-0 summary shown above (resolution ramp). */
+  covered?: boolean;
 }
 
 export interface SummaryRow {
@@ -62,6 +64,8 @@ export interface SummaryRow {
   startTimestamp: number;
   endTimestamp: number;
   sourceCount: number;
+  /** Set on view rows only: this summary is already rolled into a higher tier shown above (resolution ramp). */
+  covered?: boolean;
 }
 
 export type AddObservationResult =
@@ -71,8 +75,27 @@ export type AddObservationResult =
 export interface ObservationMatch {
   id: string;
   text: string;
-  timestamp: number;
-  score: number; // lower = better (cosine distance blended with time penalty)
+  timestamp: number;     // observation timestamp, or a summary's end timestamp
+  score: number;         // lower = better (cosine distance blended with time penalty)
+  kind: 'observation' | 'summary';
+  tier?: number;         // summaries only
+  startTimestamp?: number; // summaries only
+}
+
+export interface SummarySource { type: 'observation' | 'summary'; id: string }
+
+export interface AdvanceResult { tier0: number; rollups: number; remaining: boolean }
+
+/**
+ * Summaries are immutable once written, so a degenerate synthesis result
+ * (empty, a refusal, a couple of words) must be treated as a failure — thrown
+ * here, caught by the trigger, retried next time — rather than stored forever.
+ */
+const MIN_SUMMARY_CHARS = 40;
+export function checkSynthOutput(text: string): string {
+  const t = text.trim();
+  if (t.length < MIN_SUMMARY_CHARS) throw new Error(`synthesis returned degenerate output (${t.length} chars)`);
+  return t;
 }
 
 const DEDUP_WINDOW_MS = 24 * 3600 * 1000;
@@ -134,10 +157,47 @@ export class MemoryDO extends DurableObject<Env> {
         is_dirty        INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_sum_model ON summaries(model_id);
+      CREATE TABLE IF NOT EXISTS summary_sources (
+        summary_id  TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id   TEXT NOT NULL,
+        PRIMARY KEY (summary_id, source_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_ss_source ON summary_sources(source_type, source_id);
       CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
     `);
     // Add columns introduced after the initial schema, for DOs created earlier.
     try { this.sql.exec('ALTER TABLE models ADD COLUMN last_summarized_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already present */ }
+    try { this.sql.exec('ALTER TABLE summaries ADD COLUMN embedding BLOB'); } catch { /* already present */ }
+    // Migration from the time-window pyramid (pre Aug 2026): a summary without
+    // provenance rows is invalid in this design — nothing can be covered by it
+    // and nothing can roll it up. Drop any such rows; the pyramid regrows
+    // incrementally from the observations. Idempotent and cheap.
+    this.sql.exec('DELETE FROM summaries WHERE NOT EXISTS (SELECT 1 FROM summary_sources ss WHERE ss.summary_id = summaries.id)');
+  }
+
+  private getConfig(key: string): string | undefined {
+    const row = this.sql.exec('SELECT value FROM config WHERE key = ?', key).toArray()[0] as { value: string } | undefined;
+    return row?.value;
+  }
+
+  private setConfig(key: string, value: string): void {
+    this.sql.exec('INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', key, value);
+  }
+
+  /**
+   * Route synthesis through a deterministic stub instead of Workers AI. For
+   * tests and dry runs; persisted in config so it survives across RPC calls to
+   * the same DO. Never set in production paths.
+   */
+  enableStubSynthesis(mode: 'ok' | 'fail' | 'slow' = 'ok'): void { this.setConfig('synth_stub', mode); }
+
+  private async runSynth(job: SynthJob): Promise<string> {
+    const mode = this.getConfig('synth_stub');
+    if (mode === 'fail') throw new Error('stub synthesis failure');
+    if (mode === 'slow') { await new Promise(r => setTimeout(r, 20)); return stubSynthesize(job); } // yields like a real call
+    if (mode) return stubSynthesize(job);
+    return synthesize(this.env.AI, job.system, job.user, { maxTokens: job.maxTokens });
   }
 
   private ensureSeedModels(): void {
@@ -186,11 +246,21 @@ export class MemoryDO extends DurableObject<Env> {
       const vecs = await embed(this.env.AI, rows.map(r => r.text));
       rows.forEach((r, i) => this.setObservationEmbedding(r.id, vecs[i]!));
     }
+    // Summaries are embedded too (recall returns arcs as well as receipts).
+    const srows = this.sql.exec(
+      'SELECT id, text FROM summaries WHERE embedding IS NULL OR LENGTH(embedding) != ? LIMIT ?',
+      targetBytes, Math.max(0, limit - rows.length),
+    ).toArray() as Array<{ id: string; text: string }>;
+    if (srows.length > 0) {
+      const vecs = await embed(this.env.AI, srows.map(r => r.text));
+      srows.forEach((r, i) => this.sql.exec('UPDATE summaries SET embedding = ? WHERE id = ?', floatsToBlob(normalizeVec(vecs[i]!)), r.id));
+    }
     const remaining = (this.sql.exec(
-      'SELECT COUNT(*) AS c FROM observations WHERE embedding IS NULL OR LENGTH(embedding) != ?',
-      targetBytes,
+      `SELECT (SELECT COUNT(*) FROM observations WHERE embedding IS NULL OR LENGTH(embedding) != ?)
+            + (SELECT COUNT(*) FROM summaries WHERE embedding IS NULL OR LENGTH(embedding) != ?) AS c`,
+      targetBytes, targetBytes,
     ).one() as { c: number }).c;
-    return { done: rows.length, remaining, dim: EMBEDDING_DIM };
+    return { done: rows.length + srows.length, remaining, dim: EMBEDDING_DIM };
   }
 
   // ---------- Models ----------
@@ -305,6 +375,15 @@ export class MemoryDO extends DurableObject<Env> {
     this.sql.exec('UPDATE observations SET embedding = ? WHERE id = ?', floatsToBlob(normalizeVec(embedding)), observationId);
   }
 
+  setSummaryEmbedding(summaryId: string, embedding: number[]): void {
+    this.sql.exec('UPDATE summaries SET embedding = ? WHERE id = ?', floatsToBlob(normalizeVec(embedding)), summaryId);
+  }
+
+  /** Add a model tag to an existing observation (no-op if already tagged). */
+  tagObservation(observationId: string, modelId: string): void {
+    this.sql.exec('INSERT OR IGNORE INTO observation_tags (observation_id, model_id) VALUES (?, ?)', observationId, modelId);
+  }
+
   /** Observation ids that still need an embedding (for backfill / seeding). */
   idsMissingEmbedding(limit = 500): Array<{ id: string; text: string }> {
     return this.sql
@@ -318,21 +397,28 @@ export class MemoryDO extends DurableObject<Env> {
    * pre-normalized, so cosine similarity is a plain dot product. Fine for the
    * single-DO scale we target; revisit with Vectorize only if it gets slow.
    */
-  searchObservations(query: number[], limit = 20, timeWeight = 0.3): ObservationMatch[] {
+  searchObservations(query: number[], limit = 20, timeWeight = 0.3, includeSummaries = true): ObservationMatch[] {
     const q = normalizeVec(query);
     const now = Date.now();
-    const rows = this.sql
+    const score = (v: ArrayBuffer, ts: number) => {
+      const sim = dot(q, blobToFloats(v)); // both unit-length → cosine similarity
+      return (1 - sim) * (1 - timeWeight) + computeTimePenalty(ts, now) * timeWeight;
+    };
+    const obs = this.sql
       .exec('SELECT id, text, timestamp, embedding FROM observations WHERE embedding IS NOT NULL')
       .toArray() as Array<{ id: string; text: string; timestamp: number; embedding: ArrayBuffer }>;
+    const scored: ObservationMatch[] = obs.map(r => ({ id: r.id, text: r.text, timestamp: r.timestamp, score: score(r.embedding, r.timestamp), kind: 'observation' as const }));
 
-    const scored: ObservationMatch[] = rows.map(r => {
-      const v = blobToFloats(r.embedding);
-      const sim = dot(q, v); // both unit-length → cosine similarity
-      const distance = 1 - sim;
-      const timePenalty = computeTimePenalty(r.timestamp, now);
-      const score = distance * (1 - timeWeight) + timePenalty * timeWeight;
-      return { id: r.id, text: r.text, timestamp: r.timestamp, score };
-    });
+    if (includeSummaries) {
+      // Arcs, not just receipts: summaries are searchable too. Recency uses the
+      // summary's end timestamp — the newest material it covers.
+      const sums = this.sql
+        .exec('SELECT id, text, tier, start_timestamp, end_timestamp, embedding FROM summaries WHERE embedding IS NOT NULL')
+        .toArray() as Array<{ id: string; text: string; tier: number; start_timestamp: number; end_timestamp: number; embedding: ArrayBuffer }>;
+      for (const s of sums) {
+        scored.push({ id: s.id, text: s.text, timestamp: s.end_timestamp, score: score(s.embedding, s.end_timestamp), kind: 'summary', tier: s.tier, startTimestamp: s.start_timestamp });
+      }
+    }
     scored.sort((a, b) => a.score - b.score);
     return scored.slice(0, limit);
   }
@@ -349,11 +435,8 @@ export class MemoryDO extends DurableObject<Env> {
 
   /**
    * A model's observations, newest first. `afterTs` (exclusive) restricts to
-   * observations newer than that timestamp — the read path passes the latest
-   * summary's end timestamp so views show only the unsummarized tail, while the
-   * synthesis path omits it to see everything. An observation stamped exactly
-   * at a summary's end is the last one that summary covered, so strict > is
-   * the right boundary.
+   * observations newer than that timestamp. (The read path's verbatim tail is
+   * provenance-based — see listTailForModel; this is the plain listing.)
    */
   listObservationsForModel(modelId: string, limit = 200, afterTs = 0): ObservationRow[] {
     const rows = this.sql.exec(
@@ -361,37 +444,155 @@ export class MemoryDO extends DurableObject<Env> {
        FROM observations o
        JOIN observation_tags t ON t.observation_id = o.id
        WHERE t.model_id = ? AND o.timestamp > ?
-       ORDER BY o.timestamp DESC
+       ORDER BY o.timestamp DESC, o.rowid DESC
        LIMIT ?`,
       modelId, afterTs, limit,
     ).toArray() as Array<Record<string, unknown>>;
     return rows.map(toObservationRow);
   }
 
-  /** Tiered summaries for a model, oldest tier first (populated by Task #6). */
+  // ---------- Pyramid: provenance queries ----------
+
+  /**
+   * The model's COVER: summaries (any tier) that have not been rolled into a
+   * higher summary. Together with the unsummarized tail this partitions the
+   * model's history exactly, by provenance. Chronological by start.
+   */
   listSummariesForModel(modelId: string): SummaryRow[] {
-    const rows = this.sql.exec(
-      `SELECT id, tier, text, start_timestamp, end_timestamp, source_count
-       FROM summaries WHERE model_id = ? ORDER BY tier ASC, start_timestamp ASC`,
+    const cover = this.sql.exec(
+      `SELECT s.id, s.tier, s.text, s.start_timestamp, s.end_timestamp, s.source_count
+       FROM summaries s
+       WHERE s.model_id = ?
+         AND NOT EXISTS (SELECT 1 FROM summary_sources up WHERE up.source_type = 'summary' AND up.source_id = s.id)
+       ORDER BY s.start_timestamp ASC, s.tier ASC`,
       modelId,
     ).toArray() as Array<Record<string, unknown>>;
-    return rows.map(r => ({
-      id: r.id as string,
-      tier: r.tier as number,
-      text: r.text as string,
-      startTimestamp: r.start_timestamp as number,
-      endTimestamp: r.end_timestamp as number,
-      sourceCount: r.source_count as number,
-    }));
+    return cover.map(toSummaryRow);
   }
 
-  /** Insert one tier summary row. Used by rebuildModelSummaries; public so tests and migrations can seed pyramid state without invoking synthesis. */
-  insertSummary(modelId: string, s: { tier: number; text: string; startTimestamp: number; endTimestamp: number; sourceCount: number }): string {
+  /** Every summary of a model, all tiers, whether or not rolled up. For export and stats. */
+  listAllSummariesForModel(modelId: string): SummaryRow[] {
+    const rows = this.sql.exec(
+      `SELECT id, tier, text, start_timestamp, end_timestamp, source_count FROM summaries WHERE model_id = ? ORDER BY tier ASC, start_timestamp ASC`,
+      modelId,
+    ).toArray() as Array<Record<string, unknown>>;
+    return rows.map(toSummaryRow);
+  }
+
+  /** Sources of one summary (observation ids for tier 0, summary ids above). */
+  listSummarySources(summaryId: string): SummarySource[] {
+    return (this.sql.exec('SELECT source_type AS type, source_id AS id FROM summary_sources WHERE summary_id = ?', summaryId)
+      .toArray() as unknown as SummarySource[]);
+  }
+
+  /**
+   * Observations tagged to the model that no tier-0 summary OF THIS MODEL has
+   * consumed. Oldest first. Exact by provenance — an observation tagged to two
+   * models is unsummarized for each independently.
+   */
+  unsummarizedObservations(modelId: string, limit = 100_000): ObservationRow[] {
+    const rows = this.sql.exec(
+      `SELECT o.id, o.text, o.timestamp, o.source
+       FROM observations o
+       JOIN observation_tags t ON t.observation_id = o.id
+       WHERE t.model_id = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM summary_sources ss JOIN summaries s ON s.id = ss.summary_id
+           WHERE ss.source_type = 'observation' AND ss.source_id = o.id AND s.model_id = ?
+         )
+       ORDER BY o.timestamp ASC, o.rowid ASC
+       LIMIT ?`,
+      modelId, modelId, limit,
+    ).toArray() as Array<Record<string, unknown>>;
+    return rows.map(toObservationRow);
+  }
+
+  /** Tier-N summaries of the model not yet rolled into tier N+1. Oldest first. */
+  unrolledSummaries(modelId: string, tier: number): SummaryRow[] {
+    const rows = this.sql.exec(
+      `SELECT s.id, s.tier, s.text, s.start_timestamp, s.end_timestamp, s.source_count
+       FROM summaries s
+       WHERE s.model_id = ? AND s.tier = ?
+         AND NOT EXISTS (SELECT 1 FROM summary_sources up WHERE up.source_type = 'summary' AND up.source_id = s.id)
+       ORDER BY s.start_timestamp ASC`,
+      modelId, tier,
+    ).toArray() as Array<Record<string, unknown>>;
+    return rows.map(toSummaryRow);
+  }
+
+  /** The verbatim tail for the read path: the model's newest unsummarized observations, newest first. */
+  listTailForModel(modelId: string, limit: number): ObservationRow[] {
+    return this.unsummarizedObservations(modelId).slice(-limit).reverse();
+  }
+
+  /**
+   * What load_memory renders for a model: the cover, plus a RESOLUTION RAMP so
+   * the recent past is never flatter than `ramp` tiles per tier and the last
+   * `verbatim` observations are always shown raw — even when a higher tile
+   * already covers them. Without the ramp the view collapses at a clean batch
+   * boundary (250 observations = one tier-2 summary and nothing else) and
+   * oscillates with count; the ramp is deliberate duplication at render time,
+   * the way Angel's stream pyramid does it. Storage stays exact-once. Ramp rows
+   * carry `covered: true` so the formatter can say so.
+   */
+  listViewForModel(modelId: string, opts: { ramp?: number; verbatim?: number; tailLimit?: number } = {}): { summaries: SummaryRow[]; observations: ObservationRow[] } {
+    const ramp = opts.ramp ?? 2, verbatim = opts.verbatim ?? 5, tailLimit = opts.tailLimit ?? 15;
+    const cover = this.listSummariesForModel(modelId);
+    const top = cover.reduce((mx, s) => Math.max(mx, s.tier), -1);
+    const summaries: SummaryRow[] = [...cover];
+    for (let tier = 0; tier < top; tier++) {
+      const rows = this.sql.exec(
+        `SELECT s.id, s.tier, s.text, s.start_timestamp, s.end_timestamp, s.source_count
+         FROM summaries s
+         WHERE s.model_id = ? AND s.tier = ?
+           AND EXISTS (SELECT 1 FROM summary_sources up WHERE up.source_type = 'summary' AND up.source_id = s.id)
+         ORDER BY s.start_timestamp DESC LIMIT ?`,
+        modelId, tier, ramp,
+      ).toArray() as Array<Record<string, unknown>>;
+      summaries.push(...rows.map(r => ({ ...toSummaryRow(r), covered: true })));
+    }
+    const tail = this.listTailForModel(modelId, tailLimit); // newest first
+    const observations: ObservationRow[] = [...tail];
+    const need = verbatim - tail.length;
+    if (top >= 0 && need > 0) {
+      const rows = this.sql.exec(
+        `SELECT o.id, o.text, o.timestamp, o.source
+         FROM observations o JOIN observation_tags t ON t.observation_id = o.id
+         WHERE t.model_id = ?
+           AND EXISTS (SELECT 1 FROM summary_sources ss JOIN summaries s ON s.id = ss.summary_id
+                       WHERE ss.source_type = 'observation' AND ss.source_id = o.id AND s.model_id = ?)
+         ORDER BY o.timestamp DESC, o.rowid DESC LIMIT ?`,
+        modelId, modelId, need,
+      ).toArray() as Array<Record<string, unknown>>;
+      observations.push(...rows.map(r => ({ ...toObservationRow(r), covered: true })));
+    }
+    return { summaries, observations };
+  }
+
+  /**
+   * Insert one summary with its provenance rows (required — a summary without
+   * sources is invalid). Embeds the text (best effort) so it's recallable; a
+   * failed embed is backfilled by reembedBatch.
+   */
+  async insertSummary(
+    modelId: string,
+    s: { tier: number; text: string; startTimestamp: number; endTimestamp: number; sourceCount: number },
+    sources: SummarySource[],
+  ): Promise<string> {
+    if (sources.length === 0) throw new Error('insertSummary: a summary must have at least one source');
     const id = crypto.randomUUID();
+    let blob: Uint8Array | null = null;
+    if (!this.getConfig('synth_stub')) {
+      try { blob = floatsToBlob(normalizeVec(await this.embed(s.text))); }
+      catch (e) { console.error('[insertSummary] embed failed, storing without vector:', e); }
+    }
     this.sql.exec(
-      'INSERT INTO summaries (id, model_id, tier, text, start_timestamp, end_timestamp, source_count, is_dirty) VALUES (?, ?, ?, ?, ?, ?, ?, 0)',
-      id, modelId, s.tier, s.text, s.startTimestamp, s.endTimestamp, s.sourceCount,
+      'INSERT INTO summaries (id, model_id, tier, text, start_timestamp, end_timestamp, source_count, is_dirty, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)',
+      id, modelId, s.tier, s.text, s.startTimestamp, s.endTimestamp, s.sourceCount, blob,
     );
+    for (const src of sources) {
+      this.sql.exec('INSERT OR IGNORE INTO summary_sources (summary_id, source_type, source_id) VALUES (?, ?, ?)', id, src.type, src.id);
+    }
     return id;
   }
 
@@ -402,86 +603,150 @@ export class MemoryDO extends DurableObject<Env> {
     return row ? toModelRow(row) : undefined;
   }
 
+  // ---------- Pyramid: growth ----------
+
+  /** In-flight advance per model. A second caller awaits the running one and reports `remaining` — no double work, no hot loop. */
+  private advancing = new Map<string, Promise<AdvanceResult>>();
+
   /**
-   * Rebuild a model's tiered summaries from its observations (focus-aware
-   * synthesis, older tiers compress harder). Replaces the model's summaries in
-   * place. Returns the number of tiers written.
+   * Grow a model's pyramid incrementally: summarize FULL tier-0 batches of
+   * unsummarized observations, rolling up as soon as any tier has
+   * ROLLUP_FAN_IN unrolled summaries (so the cover stays narrow even while a
+   * backlog is being worked off). At most `maxCalls` LLM calls per invocation
+   * so a request-path trigger stays bounded; returns whether work remains.
+   * Each summary is inserted with its provenance before the next call starts,
+   * so a failure mid-run leaves a valid (partially advanced) state and the next
+   * trigger resumes. Never rewrites existing summaries.
    */
-  async rebuildModelSummaries(modelId: string, now: number = Date.now()): Promise<number> {
+  async advancePyramid(modelId: string, opts: { maxCalls?: number } = {}): Promise<AdvanceResult> {
+    const inflight = this.advancing.get(modelId);
+    if (inflight) {
+      await inflight.catch(() => undefined);
+      return { tier0: 0, rollups: 0, remaining: true };
+    }
+    const run = this.advanceInner(modelId, opts);
+    this.advancing.set(modelId, run);
+    try { return await run; } finally { this.advancing.delete(modelId); }
+  }
+
+  private async advanceInner(modelId: string, opts: { maxCalls?: number }): Promise<AdvanceResult> {
+    const maxCalls = opts.maxCalls ?? Number.POSITIVE_INFINITY;
+    const result: AdvanceResult = { tier0: 0, rollups: 0, remaining: false };
     const model = this.getModelById(modelId);
-    if (!model) return 0;
-    const obs = this.listObservationsForModel(modelId, 5000);
-    const buckets = bucketObservations(obs, now);
-    const jobs = buckets.map(b => buildSynthJob(model, b));
-    const texts = await Promise.all(jobs.map(j => synthesize(this.env.AI, j.system, j.user, { maxTokens: j.maxTokens })));
+    if (!model) return result;
+    let calls = 0;
 
-    this.sql.exec('DELETE FROM summaries WHERE model_id = ?', modelId);
-    jobs.forEach((j, i) => {
-      this.insertSummary(modelId, { tier: j.tier, text: texts[i]!, startTimestamp: j.startTs, endTimestamp: j.endTs, sourceCount: j.sourceCount });
-    });
-    this.sql.exec('UPDATE models SET last_summarized_count = ? WHERE id = ?', obs.length, modelId);
-    return jobs.length;
+    // Roll up every tier that has a full batch, climbing. Returns true if the
+    // call budget ran out with work still pending.
+    const rollupPass = async (): Promise<boolean> => {
+      for (let tier = 0; tier < 50; tier++) {
+        const groups = batchRollup(this.unrolledSummaries(modelId, tier));
+        if (groups.length === 0) {
+          if (!this.hasSummariesAtTier(modelId, tier + 1)) return false; // no tier above — done
+          continue;
+        }
+        for (const children of groups) {
+          if (calls >= maxCalls) return true;
+          const job = buildRollupJob(model, children);
+          const text = checkSynthOutput(await this.runSynth(job)); calls++;
+          await this.insertSummary(modelId, { tier: job.tier, text, startTimestamp: job.startTs, endTimestamp: job.endTs, sourceCount: children.length },
+            job.sourceIds.map(id => ({ type: 'summary' as const, id })));
+          result.rollups++;
+        }
+      }
+      return false;
+    };
+
+    // Tier 0: full batches only; the trailing partial batch stays verbatim.
+    const { batches } = batchTier0(this.unsummarizedObservations(modelId));
+    for (const batch of batches) {
+      if (calls >= maxCalls) { result.remaining = true; return result; }
+      const job = buildTier0Job(model, batch);
+      const text = checkSynthOutput(await this.runSynth(job)); calls++;
+      await this.insertSummary(modelId, { tier: 0, text, startTimestamp: job.startTs, endTimestamp: job.endTs, sourceCount: job.sourceIds.length },
+        job.sourceIds.map(id => ({ type: 'observation' as const, id })));
+      result.tier0++;
+      if (await rollupPass()) { result.remaining = true; return result; }
+    }
+    if (await rollupPass()) { result.remaining = true; return result; }
+    return result;
   }
 
-  /** Rebuild summaries for every active model (concurrency-bounded). */
-  async rebuildAllSummaries(): Promise<{ models: number; summaries: number }> {
-    const models = this.listModels();
-    let idx = 0;
-    const pool = Math.min(4, models.length);
-    await Promise.all(Array.from({ length: pool }, async () => {
-      while (idx < models.length) {
-        await this.rebuildModelSummaries(models[idx++]!.id);
-      }
-    }));
-    // Count from the DB — accumulating across the concurrent pool would race.
-    const summaries = (this.sql.exec('SELECT COUNT(*) AS c FROM summaries').one() as { c: number }).c;
-    return { models: models.length, summaries };
+  private hasSummariesAtTier(modelId: string, tier: number): boolean {
+    return (this.sql.exec('SELECT COUNT(*) AS c FROM summaries WHERE model_id = ? AND tier = ?', modelId, tier).one() as { c: number }).c > 0;
   }
 
   /**
-   * Resummarize trigger (called from record_observation). For each tagged model,
-   * rebuild its pyramid only once it has accumulated `threshold` new observations
-   * since the last build — a no-op in the common case. Failures are swallowed so
-   * recording never fails on synthesis.
+   * Advance every model, archived included (their observations are still part
+   * of the record), sequentially — one DO, one LLM at a time is plenty. For the
+   * admin catch-up loop. A synthesis failure on one model is reported in
+   * `perModel[name].error` and the sweep continues; `remaining` stays true so
+   * the loop retries it.
    */
-  async maybeResummarize(modelNames: string[], threshold = 8): Promise<string[]> {
-    const rebuilt: string[] = [];
+  async advanceAll(opts: { maxCalls?: number; model?: string } = {}): Promise<{ models: number; tier0: number; rollups: number; remaining: boolean; perModel: Record<string, AdvanceResult & { error?: string }> }> {
+    const models = opts.model ? [this.getModel(opts.model)].filter((m): m is ModelRow => !!m) : this.listModels(true);
+    let budget = opts.maxCalls ?? Number.POSITIVE_INFINITY;
+    const out = { models: models.length, tier0: 0, rollups: 0, remaining: false, perModel: {} as Record<string, AdvanceResult & { error?: string }> };
+    for (const m of models) {
+      if (budget <= 0) { out.remaining = true; break; }
+      try {
+        const r = await this.advancePyramid(m.id, { maxCalls: budget });
+        budget -= r.tier0 + r.rollups;
+        out.tier0 += r.tier0; out.rollups += r.rollups;
+        out.remaining = out.remaining || r.remaining;
+        out.perModel[m.name] = r;
+      } catch (e) {
+        console.error(`[advanceAll] ${m.name} failed:`, e);
+        out.perModel[m.name] = { tier0: 0, rollups: 0, remaining: true, error: String(e) };
+        out.remaining = true;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Delete one model's summaries and their provenance so its pyramid regrows
+   * from the observations. The surgical undo for a bad synthesis run; the
+   * observations are untouched. Admin-only, requires confirm at the endpoint.
+   */
+  unsummarizeModel(name: string): { ok: boolean; reason?: string; summaries?: number } {
+    const m = this.getModel(name);
+    if (!m) return { ok: false, reason: `No model named "${name}".` };
+    const n = (this.sql.exec('SELECT COUNT(*) AS c FROM summaries WHERE model_id = ?', m.id).one() as { c: number }).c;
+    this.sql.exec('DELETE FROM summary_sources WHERE summary_id IN (SELECT id FROM summaries WHERE model_id = ?)', m.id);
+    this.sql.exec('DELETE FROM summaries WHERE model_id = ?', m.id);
+    return { ok: true, summaries: n };
+  }
+
+  /**
+   * Request-path trigger (record_observation / load_memory). Advances each
+   * named model a bounded number of LLM calls in the background; a no-op in
+   * the common case (two indexed queries). Failures are swallowed so recording
+   * and loading never fail on synthesis.
+   */
+  async maybeResummarize(modelNames: string[], maxCalls = 4): Promise<string[]> {
+    const advanced: string[] = [];
     for (const name of modelNames) {
       const m = this.getModel(name);
       if (!m) continue;
-      const last = (this.sql.exec('SELECT last_summarized_count AS c FROM models WHERE id = ?', m.id).one() as { c: number }).c;
-      const obsCount = this.getModelConfidence(m.id).obsCount;
-      if (obsCount - last >= threshold) {
-        try { await this.rebuildModelSummaries(m.id); rebuilt.push(name); }
-        catch (e) { console.error(`[resummarize] ${name} failed:`, e); }
-      }
+      try {
+        const r = await this.advancePyramid(m.id, { maxCalls });
+        if (r.tier0 + r.rollups > 0) advanced.push(name);
+      } catch (e) { console.error(`[advance] ${name} failed:`, e); }
     }
-    return rebuilt;
+    return advanced;
   }
 
   /**
-   * Recency-first across all models — the short-term continuity substitute.
-   * Skips observations already rolled into the pyramid: an observation is
-   * covered once EVERY model it's tagged to has a summary reaching its
-   * timestamp. Covered history lives in the tier summaries; repeating it here
-   * verbatim would defeat the compression (the 71K-response bug). Untagged
-   * observations count as uncovered.
+   * Recency-first across all models — the short-term continuity substitute:
+   * simply the newest observations, whether or not a pyramid has covered them.
+   * (It used to exclude covered ones, which made the block thin whenever
+   * several models had just crossed a batch boundary — the same cliff the
+   * per-model ramp fixes. The block is capped by characters at render time.)
    */
   recentObservations(limit = 30): ObservationRow[] {
     const rows = this.sql.exec(
-      `SELECT o.id, o.text, o.timestamp, o.source
-       FROM observations o
-       WHERE NOT EXISTS (SELECT 1 FROM observation_tags t WHERE t.observation_id = o.id)
-          OR EXISTS (
-            SELECT 1 FROM observation_tags t
-            WHERE t.observation_id = o.id
-              AND NOT EXISTS (
-                SELECT 1 FROM summaries s
-                WHERE s.model_id = t.model_id AND s.end_timestamp >= o.timestamp
-              )
-          )
-       ORDER BY o.timestamp DESC
-       LIMIT ?`,
+      'SELECT id, text, timestamp, source FROM observations ORDER BY timestamp DESC, rowid DESC LIMIT ?',
       limit,
     ).toArray() as Array<Record<string, unknown>>;
     return rows.map(toObservationRow);
@@ -556,7 +821,7 @@ export class MemoryDO extends DurableObject<Env> {
     return { activeModels: models.length, underPopulated: under, fragmented: under >= 6 || models.length > 40 };
   }
 
-  getStats(): { models: number; observations: number; summaries: number; embedded: number; embeddingDim: number; observationSize: SizeStats; summarySize: SizeStats; perModel: ModelStats[] } {
+  getStats(): { models: number; observations: number; summaries: number; embedded: number; summariesEmbedded: number; embeddingDim: number; observationSize: SizeStats; summarySize: SizeStats; perModel: ModelStats[] } {
     // Blob byte length / 4 (Float32) = vector dimension. Lets a migration check
     // distinguish old 1536-dim (OpenAI) data from new 1024-dim (bge-m3).
     const dimRow = this.sql.exec('SELECT LENGTH(embedding) AS b FROM observations WHERE embedding IS NOT NULL LIMIT 1').toArray()[0] as { b: number } | undefined;
@@ -565,6 +830,7 @@ export class MemoryDO extends DurableObject<Env> {
       observations: this.sql.exec('SELECT COUNT(*) AS c FROM observations').one().c as number,
       summaries: this.sql.exec('SELECT COUNT(*) AS c FROM summaries').one().c as number,
       embedded: this.sql.exec('SELECT COUNT(*) AS c FROM observations WHERE embedding IS NOT NULL').one().c as number,
+      summariesEmbedded: this.sql.exec('SELECT COUNT(*) AS c FROM summaries WHERE embedding IS NOT NULL').one().c as number,
       embeddingDim: dimRow ? dimRow.b / 4 : 0,
       observationSize: this.sizeStats('observations'),
       summarySize: this.sizeStats('summaries'),
@@ -572,20 +838,47 @@ export class MemoryDO extends DurableObject<Env> {
     };
   }
 
+  /**
+   * Read-only export of one model: row, every summary (all tiers, with
+   * provenance), every observation (oldest first, no embeddings), and the
+   * unsummarized tail ids. The verification tool for the pyramid.
+   */
+  exportModel(name: string): { model: ModelRow; summaries: Array<SummaryRow & { sources: SummarySource[] }>; observations: ObservationRow[]; unsummarized: string[] } | undefined {
+    const model = this.getModel(name);
+    if (!model) return undefined;
+    return {
+      model,
+      summaries: this.listAllSummariesForModel(model.id).map(s => ({ ...s, sources: this.listSummarySources(s.id) })),
+      observations: this.listObservationsForModel(model.id, 100_000).reverse(),
+      unsummarized: this.unsummarizedObservations(model.id).map(o => o.id),
+    };
+  }
+
   /** One row per model (active and archived), biggest first: observation + summary counts, sizes, tier depth, time span. */
   private perModelStats(): ModelStats[] {
     const rows = this.sql.exec(
-      `SELECT m.name, m.is_seed, m.archived, m.created_at,
+      `SELECT m.id, m.name, m.is_seed, m.archived, m.created_at,
               (SELECT COUNT(*) FROM observation_tags t WHERE t.model_id = m.id) AS obs,
               (SELECT COALESCE(SUM(LENGTH(o.text)), 0) FROM observation_tags t JOIN observations o ON o.id = t.observation_id WHERE t.model_id = m.id) AS obs_chars,
               (SELECT MIN(o.timestamp) FROM observation_tags t JOIN observations o ON o.id = t.observation_id WHERE t.model_id = m.id) AS earliest,
               (SELECT MAX(o.timestamp) FROM observation_tags t JOIN observations o ON o.id = t.observation_id WHERE t.model_id = m.id) AS latest,
               (SELECT COUNT(*) FROM summaries s WHERE s.model_id = m.id) AS sums,
               (SELECT COALESCE(SUM(LENGTH(s.text)), 0) FROM summaries s WHERE s.model_id = m.id) AS sum_chars,
-              (SELECT COALESCE(MAX(s.tier), -1) FROM summaries s WHERE s.model_id = m.id) AS top_tier
+              (SELECT COALESCE(MAX(s.tier), -1) FROM summaries s WHERE s.model_id = m.id) AS top_tier,
+              (SELECT COUNT(*) FROM observation_tags t WHERE t.model_id = m.id AND NOT EXISTS (
+                 SELECT 1 FROM summary_sources ss JOIN summaries s ON s.id = ss.summary_id
+                 WHERE ss.source_type = 'observation' AND ss.source_id = t.observation_id AND s.model_id = m.id)) AS unsummarized,
+              (SELECT COALESCE(SUM(LENGTH(o.text)), 0) FROM observation_tags t JOIN observations o ON o.id = t.observation_id
+                 WHERE t.model_id = m.id AND NOT EXISTS (
+                 SELECT 1 FROM summary_sources ss JOIN summaries s ON s.id = ss.summary_id
+                 WHERE ss.source_type = 'observation' AND ss.source_id = o.id AND s.model_id = m.id)) AS tail_chars,
+              (SELECT COUNT(*) FROM summaries s WHERE s.model_id = m.id AND NOT EXISTS (
+                 SELECT 1 FROM summary_sources up WHERE up.source_type = 'summary' AND up.source_id = s.id)) AS cover_count,
+              (SELECT COALESCE(SUM(LENGTH(s.text)), 0) FROM summaries s WHERE s.model_id = m.id AND NOT EXISTS (
+                 SELECT 1 FROM summary_sources up WHERE up.source_type = 'summary' AND up.source_id = s.id)) AS cover_chars
        FROM models m
        ORDER BY obs DESC, m.name`,
-    ).toArray() as Array<{ name: string; is_seed: number; archived: number; created_at: number; obs: number; obs_chars: number; earliest: number | null; latest: number | null; sums: number; sum_chars: number; top_tier: number }>;
+    ).toArray() as Array<{ id: string; name: string; is_seed: number; archived: number; created_at: number; obs: number; obs_chars: number; earliest: number | null; latest: number | null; sums: number; sum_chars: number; top_tier: number; unsummarized: number; tail_chars: number; cover_count: number; cover_chars: number }>;
     return rows.map(r => ({
       name: r.name,
       seed: r.is_seed === 1,
@@ -601,7 +894,19 @@ export class MemoryDO extends DurableObject<Env> {
       summaryChars: r.sum_chars,
       summaryTokens: Math.round(r.sum_chars / 4),
       topTier: r.top_tier,
+      unsummarized: r.unsummarized,
+      coverSummaries: r.cover_count,
+      coverChars: r.cover_chars,
+      tailChars: r.tail_chars,
+      ...this.viewSize(r.id),
     }));
+  }
+
+  /** What load_memory would render for a model (cover + ramp + tail), measured on the real view. */
+  private viewSize(modelId: string): { viewSummaries: number; viewObservations: number; viewChars: number; viewTokens: number } {
+    const v = this.listViewForModel(modelId);
+    const chars = v.summaries.reduce((n, s) => n + s.text.length, 0) + v.observations.reduce((n, o) => n + o.text.length, 0);
+    return { viewSummaries: v.summaries.length, viewObservations: v.observations.length, viewChars: chars, viewTokens: Math.round(chars / 4) };
   }
 
   /** Text-length distribution for a table with a `text` column. Tokens are a chars/4 estimate. */
@@ -629,6 +934,7 @@ export class MemoryDO extends DurableObject<Env> {
   resetMemory(): { cleared: true } {
     this.sql.exec('DELETE FROM observation_tags');
     this.sql.exec('DELETE FROM observations');
+    this.sql.exec('DELETE FROM summary_sources');
     this.sql.exec('DELETE FROM summaries');
     this.sql.exec('DELETE FROM models');
     this.sql.exec('DELETE FROM config');
@@ -642,6 +948,20 @@ export interface ModelStats {
   observations: number; observationChars: number; observationTokens: number; meanObservationChars: number;
   earliest: number | null; latest: number | null;
   summaries: number; summaryChars: number; summaryTokens: number; topTier: number;
+  unsummarized: number;
+  coverSummaries: number; coverChars: number; tailChars: number;
+  viewSummaries: number; viewObservations: number; viewChars: number; viewTokens: number;
+}
+
+function toSummaryRow(r: Record<string, unknown>): SummaryRow {
+  return {
+    id: r.id as string,
+    tier: r.tier as number,
+    text: r.text as string,
+    startTimestamp: r.start_timestamp as number,
+    endTimestamp: r.end_timestamp as number,
+    sourceCount: r.source_count as number,
+  };
 }
 
 export interface SizeStats {

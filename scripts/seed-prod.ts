@@ -51,7 +51,12 @@ async function main() {
     process.stdout.write(`\r  loaded ${Math.min(i + CHUNK, seed.observations.length)}/${seed.observations.length}`);
   }
   console.log('\nbuilding pyramid…');
-  console.log('  ' + JSON.stringify(await admin('/admin/rebuild', { userId: USER })));
+  // Incremental and resumable: each call does up to maxCalls LLM calls.
+  for (let round = 1; ; round++) {
+    const r = await admin('/admin/advance', { userId: USER, maxCalls: 10 });
+    console.log(`  round ${round}: +${r.tier0} tier-0, +${r.rollups} rollups${r.remaining ? '' : ' — done'}`);
+    if (!r.remaining) break;
+  }
   console.log('done.');
 }
 

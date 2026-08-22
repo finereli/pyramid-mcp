@@ -10,10 +10,16 @@
  */
 import type { MemoryDO } from './memory-do.js';
 import { formatRecall, formatRecentNotes, formatModelView, formatReceipts, formatModelIndex } from './format.js';
+import { renderWithBudget } from './pyramid.js';
 
 const RECALL_LIMIT = 15;
 const RECENT_NOTES_COUNT = 30;
 const MODEL_VIEW_OBS = 15;
+/** Resolution ramp: newest covered summaries shown per lower tier, and newest observations always shown verbatim. */
+const RAMP_PER_TIER = 2;
+const RAMP_VERBATIM = 5;
+/** Per-model render budget (chars). Generous by design — it shapes a pathological view, it does not drop data from the store. */
+const MODEL_VIEW_BUDGET_CHARS = 16_000;
 const RAG_PER_TOPIC = 6;
 
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
@@ -189,7 +195,7 @@ const TOOLS: ToolDef[] = [
   {
     name: 'recall',
     description:
-      'Search memory for specific facts, details, or context. Use this to verify names, dates, numbers, client details, or any specific information before stating it as fact. Returns raw matching observations (most relevant first), recency-weighted — synthesize them yourself rather than echoing them verbatim.',
+      'Search memory for specific facts, details, or context. Use this to verify names, dates, numbers, client details, or any specific information before stating it as fact — and to fill in anything a loaded model view left out. Returns raw matches (most relevant first, recency-weighted): observations are receipts, summaries (labeled with their date range and tier) are arcs. Synthesize them yourself rather than echoing them verbatim.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -233,22 +239,27 @@ const TOOLS: ToolDef[] = [
 
       const ragTopics: string[] = [];
       const views: string[] = [];
+      const loadedNames: string[] = [];
       for (const t of topics) {
         const model = byName.get(t);
         if (model) {
           const conf = memory.getModelConfidence(model.id);
-          const summaries = memory.listSummariesForModel(model.id);
-          // Verbatim notes show only the unsummarized tail — everything up to
-          // the latest summary's end already lives in the tier summaries, and
-          // repeating it verbatim would defeat the pyramid's compression.
-          const summarizedUntil = summaries.reduce((mx, s) => Math.max(mx, s.endTimestamp), 0);
-          const obs = memory.listObservationsForModel(model.id, MODEL_VIEW_OBS, summarizedUntil);
-          views.push(formatModelView(model, conf, summaries, obs));
+          // The cover (summaries not rolled into a higher one) plus the
+          // unsummarized tail partition the model's history exactly; the ramp
+          // adds the newest covered tiles so the recent past never goes flat
+          // at a batch boundary; a generous budget guards against a pathological model.
+          const raw = memory.listViewForModel(model.id, { ramp: RAMP_PER_TIER, verbatim: RAMP_VERBATIM, tailLimit: MODEL_VIEW_OBS });
+          const view = renderWithBudget(raw.summaries, raw.observations, MODEL_VIEW_BUDGET_CHARS);
+          views.push(formatModelView(model, conf, view.summaries, view.observations));
+          loadedNames.push(model.name);
         } else {
           ragTopics.push(t);
         }
       }
       if (views.length > 0) blocks.push(`# Loaded models\n\n${views.join('\n\n')}`);
+      // Loading is also a growth trigger: catch up any pending tier-0 batches
+      // or rollups in the background (bounded; a no-op when nothing's pending).
+      if (loadedNames.length > 0) memory.background(memory.maybeResummarize(loadedNames));
 
       if (ragTopics.length > 0) {
         try {
@@ -274,7 +285,7 @@ const TOOLS: ToolDef[] = [
   {
     name: 'memory_stats',
     description:
-      'Size and shape of this memory store: counts of models, observations, and summaries, plus the text-length distribution of observations and summaries (min/max/mean/median/total chars, with a chars/4 token estimate). Read-only. Use when asked how big memory is, or to sanity-check growth.',
+      'Size and shape of this memory store: counts of models, observations, and summaries, the text-length distribution of observations and summaries (min/max/mean/median/total chars, with a chars/4 token estimate), and per model what load_memory would actually render (cover summaries + verbatim tail). Read-only. Use when asked how big memory is, or to sanity-check growth.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (memory) => formatStats(memory.getStats()),
   },
@@ -375,17 +386,17 @@ function formatStats(st: ReturnType<MemoryDO['getStats']>): string {
   const row = (label: string, z: { count: number; minChars: number; maxChars: number; meanChars: number; medianChars: number; totalChars: number; minTokens: number; maxTokens: number; meanTokens: number; medianTokens: number; totalTokens: number }) =>
     `${label} (${z.count}): min ${z.minChars} chars / ~${z.minTokens} tok · max ${z.maxChars} / ~${z.maxTokens} · mean ${z.meanChars} / ~${z.meanTokens} · median ${z.medianChars} / ~${z.medianTokens} · total ${z.totalChars} / ~${z.totalTokens}`;
   return [
-    `Models: ${st.models} active · Observations: ${st.observations} (${st.embedded} embedded, dim ${st.embeddingDim}) · Summaries: ${st.summaries}`,
+    `Models: ${st.models} active · Observations: ${st.observations} (${st.embedded} embedded, dim ${st.embeddingDim}) · Summaries: ${st.summaries} (${st.summariesEmbedded} embedded)`,
     row('Observations', st.observationSize),
     row('Summaries', st.summarySize),
     '(tokens ≈ chars / 4)',
     '',
-    'Per model (biggest first): obs · obs chars/~tok · mean obs chars · summaries (top tier) · summary chars/~tok · span',
+    'Per model (biggest first): obs (unsummarized tail) · obs chars/~tok · summaries (top tier) · all-summary chars/~tok · LOAD = what load_memory renders (cover + ramp summaries, tail + ramp obs) chars/~tok · span',
     ...st.perModel.map(m => {
       const flags = [m.seed ? 'seed' : '', m.archived ? 'archived' : ''].filter(Boolean).join(', ');
       const span = m.earliest && m.latest ? `${day(m.earliest)} → ${day(m.latest)}` : 'no observations';
       const tier = m.summaries ? ` (tier ${m.topTier})` : '';
-      return `- ${m.name}${flags ? ` [${flags}]` : ''}: ${m.observations} obs · ${m.observationChars}/~${m.observationTokens} · mean ${m.meanObservationChars} · ${m.summaries} sum${tier} · ${m.summaryChars}/~${m.summaryTokens} · ${span}`;
+      return `- ${m.name}${flags ? ` [${flags}]` : ''}: ${m.observations} obs (${m.unsummarized} tail) · ${m.observationChars}/~${m.observationTokens} · ${m.summaries} sum${tier} · ${m.summaryChars}/~${m.summaryTokens} · LOAD ${m.viewSummaries} sum + ${m.viewObservations} obs = ${m.viewChars}/~${m.viewTokens} · ${span}`;
     }),
   ].join('\n');
 }

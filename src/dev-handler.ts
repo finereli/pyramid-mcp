@@ -18,11 +18,12 @@ export async function devHandler(request: Request, env: Env): Promise<Response> 
     return Response.json(await stub.bulkLoad(models ?? [], observations ?? []));
   }
 
-  if (url.pathname === '/rebuild' && request.method === 'POST') {
+  if (url.pathname === '/advance' && request.method === 'POST') {
     const userId = request.headers.get('x-user-id');
     if (!userId) return new Response('Missing x-user-id', { status: 401 });
+    const { model, maxCalls } = (await request.json().catch(() => ({}))) as { model?: string; maxCalls?: number };
     const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(userId));
-    return Response.json(await stub.rebuildAllSummaries());
+    return Response.json(await stub.advanceAll({ model, maxCalls }));
   }
 
   if (url.pathname === '/mcp') {
@@ -56,10 +57,14 @@ export async function adminHandler(request: Request, env: Env): Promise<Response
     return Response.json(await stubFor(userId).bulkLoad(models ?? [], observations ?? []));
   }
 
-  if (url.pathname === '/admin/rebuild' && request.method === 'POST') {
-    const { userId } = (await request.json()) as { userId?: string };
+  // Grow a user's pyramids incrementally (tier-0 batches, then rollups), bounded
+  // by maxCalls LLM calls per request. Loop until `remaining` is false. Optional
+  // `model` restricts to one model. Idempotent and resumable: summaries are
+  // immutable and provenance-tracked, so re-running never duplicates work.
+  if (url.pathname === '/admin/advance' && request.method === 'POST') {
+    const { userId, model, maxCalls } = (await request.json()) as { userId?: string; model?: string; maxCalls?: number };
     if (!userId) return new Response('userId (body) required', { status: 400 });
-    return Response.json(await stubFor(userId).rebuildAllSummaries());
+    return Response.json(await stubFor(userId).advanceAll({ model, maxCalls: maxCalls ?? 10 }));
   }
 
   // Read-only — inspect a user's DO (counts + embedding dimension) before a migration.
@@ -67,6 +72,14 @@ export async function adminHandler(request: Request, env: Env): Promise<Response
     const { userId } = (await request.json()) as { userId?: string };
     if (!userId) return new Response('userId (body) required', { status: 400 });
     return Response.json(await stubFor(userId).getStats());
+  }
+
+  // Read-only — dump one model (row, summaries, observations) for inspection.
+  if (url.pathname === '/admin/model' && request.method === 'POST') {
+    const { userId, model } = (await request.json()) as { userId?: string; model?: string };
+    if (!userId || !model) return new Response('userId + model (body) required', { status: 400 });
+    const out = await stubFor(userId).exportModel(model);
+    return out ? Response.json(out) : new Response('model not found', { status: 404 });
   }
 
   // Read-only — run a recall against a user's DO (verifies the full embed+search
@@ -85,6 +98,14 @@ export async function adminHandler(request: Request, env: Env): Promise<Response
     const { userId, limit } = (await request.json()) as { userId?: string; limit?: number };
     if (!userId) return new Response('userId (body) required', { status: 400 });
     return Response.json(await stubFor(userId).reembedBatch(limit ?? 20));
+  }
+
+  // Surgical undo — drop one model's summaries + provenance so its pyramid regrows
+  // from the observations (which are untouched). Requires confirm:true.
+  if (url.pathname === '/admin/unsummarize' && request.method === 'POST') {
+    const { userId, model, confirm } = (await request.json()) as { userId?: string; model?: string; confirm?: boolean };
+    if (!userId || !model || confirm !== true) return new Response('userId + model + confirm:true (body) required', { status: 400 });
+    return Response.json(await stubFor(userId).unsummarizeModel(model));
   }
 
   // Destructive — wipe a user's memory back to the seed models. Requires confirm:true.

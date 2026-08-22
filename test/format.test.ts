@@ -40,8 +40,12 @@ describe('formatRecentNotes', () => {
 
 describe('formatRecall', () => {
   it('numbers and dates matches', () => {
-    const m: ObservationMatch[] = [{ id: 'a', text: 'closed at $4k', timestamp: NOW, score: 0.1 }];
+    const m: ObservationMatch[] = [{ id: 'a', text: 'closed at $4k', timestamp: NOW, score: 0.1, kind: 'observation' }];
     expect(formatRecall(m)).toBe('[1] [2026-05-30] closed at $4k');
+  });
+  it('labels summaries with their range and tier', () => {
+    const m: ObservationMatch[] = [{ id: 's', text: 'the arc', timestamp: NOW, startTimestamp: NOW - 10 * DAY, score: 0.2, kind: 'summary', tier: 1 }];
+    expect(formatRecall(m)).toBe('[1] [2026-05-20–2026-05-30 · summary tier 1] the arc');
   });
   it('handles no matches', () => {
     expect(formatRecall([])).toBe('No relevant memories found.');
@@ -54,6 +58,24 @@ describe('formatModelIndex / formatModelView', () => {
     const out = formatModelIndex([model]);
     expect(out).toContain('# Model index');
     expect(out).toContain('- coaching: coaching practice');
+  });
+  it('renders the cover oldest-first with tier labels, then the tail', () => {
+    const out = formatModelView(
+      model,
+      { obsCount: 30, earliest: NOW - 40 * DAY, latest: NOW },
+      [
+        { id: 's1', tier: 1, text: 'old arc', startTimestamp: NOW - 40 * DAY, endTimestamp: NOW - 20 * DAY, sourceCount: 5 },
+        { id: 's0', tier: 0, text: 'recent batch', startTimestamp: NOW - 19 * DAY, endTimestamp: NOW - 2 * DAY, sourceCount: 10 },
+      ],
+      [{ id: 'o1', text: 'fresh note', timestamp: NOW, source: 'direct' }],
+      NOW,
+    );
+    const i1 = out.indexOf('[tier 1 · 5 tier-0 summaries · 2026-04-20–2026-05-10]\nold arc');
+    const i0 = out.indexOf('[tier 0 · 10 obs · 2026-05-11–2026-05-28]\nrecent batch');
+    const it = out.indexOf('Recent notes (verbatim):\n- [2026-05-30] fresh note');
+    expect(i1).toBeGreaterThan(0);
+    expect(i0).toBeGreaterThan(i1);
+    expect(it).toBeGreaterThan(i0);
   });
   it('renders a view with confidence + verbatim notes', () => {
     const out = formatModelView(

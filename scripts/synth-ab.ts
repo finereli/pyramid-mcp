@@ -16,7 +16,7 @@
  *                the default account.
  */
 import { readFileSync, existsSync, writeFileSync } from 'node:fs';
-import { buildSynthJob, bucketObservations } from '../src/pyramid.js';
+import { buildTier0Job, batchTier0 } from '../src/pyramid.js';
 import type { ModelRow, ObservationRow } from '../src/memory-do.js';
 
 const SEED_PATH = 'seed-data/seed.json';
@@ -120,7 +120,7 @@ async function main() {
   const lines: string[] = [
     `# Synth A/B — gpt-4o-mini vs Llama 3.3 70B (fp8-fast)`,
     ``,
-    `Generated from \`${SEED_PATH}\` using the production \`buildSynthJob\` prompts.`,
+    `Generated from \`${SEED_PATH}\` using the production \`buildTier0Job\` prompts (tier-0 batches only).`,
     `Models under test: ${modelNames.join(', ')}`,
     ``,
   ];
@@ -132,13 +132,13 @@ async function main() {
       id: name, name, description: descByName.get(name) ?? null,
       isSeed: false, archived: false, createdAt: now,
     };
-    const buckets = bucketObservations(obs, now);
-    console.log(`\n=== ${name} — ${obs.length} obs, ${buckets.length} tier(s) ===`);
+    const { batches } = batchTier0(obs);
+    console.log(`\n=== ${name} — ${obs.length} obs, ${batches.length} tier-0 batch(es) ===`);
     lines.push(`---\n\n## Model: \`${name}\` — ${obs.length} obs`, `_Lens: ${model.description ?? '(none)'}_`, ``);
 
-    for (const bucket of buckets) {
-      const job = buildSynthJob(model, bucket);
-      console.log(`  tier ${job.tier} (${bucket.tier.label}, ${job.sourceCount} obs) …`);
+    for (const batch of batches) {
+      const job = buildTier0Job(model, batch);
+      console.log(`  tier ${job.tier} (${job.sourceIds.length} obs) …`);
 
       const t0 = Date.now();
       let openaiOut = '', cfOut = '';
@@ -150,7 +150,7 @@ async function main() {
       const t2 = Date.now();
 
       lines.push(
-        `### Tier ${job.tier} — ${bucket.tier.label} (${job.sourceCount} obs, target ~${bucket.tier.targetChars} chars)`,
+        `### Tier ${job.tier} (${job.sourceIds.length} obs, target ~${job.targetChars} chars)`,
         ``,
         `**gpt-4o-mini** (${t1 - t0}ms, ${openaiOut.length} chars)`,
         ``, `> ${openaiOut.replace(/\n/g, '\n> ')}`, ``,

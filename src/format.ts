@@ -30,10 +30,20 @@ export function formatConfidenceMeta(
   return `[${name} · ${conf.obsCount} obs · spans ${spanLabel} · latest ${latestDate} (${recency})]`;
 }
 
-/** Raw recall results — numbered, dated, newest-relevant first. Agent synthesizes. */
+/** Label for a match: observations by date, summaries by range and tier. */
+function matchLabel(m: ObservationMatch): string {
+  if (m.kind === 'summary') {
+    const start = m.startTimestamp ?? m.timestamp;
+    const range = isoDate(start) === isoDate(m.timestamp) ? isoDate(m.timestamp) : `${isoDate(start)}–${isoDate(m.timestamp)}`;
+    return `[${range} · summary tier ${m.tier ?? 0}]`;
+  }
+  return `[${isoDate(m.timestamp)}]`;
+}
+
+/** Raw recall results — numbered, dated, best first. Observations are receipts, summaries are arcs. Agent synthesizes. */
 export function formatRecall(matches: ObservationMatch[]): string {
   if (matches.length === 0) return 'No relevant memories found.';
-  return matches.map((m, i) => `[${i + 1}] [${isoDate(m.timestamp)}] ${m.text}`).join('\n\n');
+  return matches.map((m, i) => `[${i + 1}] ${matchLabel(m)} ${m.text}`).join('\n\n');
 }
 
 /**
@@ -54,12 +64,14 @@ export function formatRecentNotes(obs: ObservationRow[], capChars = 6000): strin
 }
 
 /**
- * A model view: description + confidence, tiered summaries (oldest→newest, with
- * tier metadata), then recent verbatim observations (oldest→newest). The caller
- * passes only the UNSUMMARIZED tail as recentObs — observations a summary
- * already covers must not reappear verbatim, or the view carries the same
- * history twice. Summaries are empty until the pyramid populates them; the view
- * degrades to recent observations alone, which is correct.
+ * A model view: description + confidence, then the pyramid COVER — summaries
+ * not yet rolled into a higher one — oldest first with tier (depth) and date
+ * range on each, then the unsummarized tail verbatim (oldest→newest). Reading
+ * the cover oldest-first gives old arcs at high tiers and progressively finer
+ * recent summaries: the resolution gradient. The caller passes only the
+ * UNSUMMARIZED tail as recentObs — observations a summary already covers must
+ * not reappear verbatim, or the view carries the same history twice. With no
+ * summaries yet the view degrades to recent observations alone, which is correct.
  */
 export function formatModelView(
   model: ModelRow,
@@ -71,14 +83,17 @@ export function formatModelView(
   const parts: string[] = [];
   parts.push(`## ${model.name} — ${model.description ?? ''}`.trimEnd());
   parts.push(formatConfidenceMeta(model.name, conf, now));
-  // Oldest arc first (highest tier) → newest, then recent verbatim notes.
-  for (const s of [...summaries].sort((a, b) => b.tier - a.tier)) {
-    parts.push(`\n[tier ${s.tier} · ${s.sourceCount} obs · ${isoDate(s.startTimestamp)}–${isoDate(s.endTimestamp)}]\n${s.text}`);
+  // Chronological by start (ties: higher tier first), then recent verbatim notes.
+  // Ramp rows (already covered by a tile above) say so, so the overlap is explicit.
+  for (const s of [...summaries].sort((a, b) => a.startTimestamp - b.startTimestamp || b.tier - a.tier)) {
+    const unit = s.tier === 0 ? 'obs' : `tier-${s.tier - 1} summaries`;
+    const covered = s.covered ? ' · finer view of a period summarized above' : '';
+    parts.push(`\n[tier ${s.tier} · ${s.sourceCount} ${unit} · ${isoDate(s.startTimestamp)}–${isoDate(s.endTimestamp)}${covered}]\n${s.text}`);
   }
   if (recentObs.length > 0) {
     const ordered = [...recentObs].sort((a, b) => a.timestamp - b.timestamp); // oldest→newest
     parts.push('\nRecent notes (verbatim):');
-    for (const o of ordered) parts.push(`- [${isoDate(o.timestamp)}] ${o.text}`);
+    for (const o of ordered) parts.push(`- [${isoDate(o.timestamp)}${o.covered ? ' · also summarized above' : ''}] ${o.text}`);
   }
   return parts.join('\n');
 }
@@ -86,7 +101,7 @@ export function formatModelView(
 /** Observation-RAG receipts block for load_memory. */
 export function formatReceipts(matches: ObservationMatch[]): string {
   if (matches.length === 0) return '';
-  const lines = matches.map(m => `- [${isoDate(m.timestamp)}] ${m.text}`);
+  const lines = matches.map(m => `- ${matchLabel(m)} ${m.text}`);
   return `# Relevant receipts\n_Specific facts retrieved from memory — names, dates, numbers. Use as receipts, not a transcript._\n\n${lines.join('\n')}`;
 }
 

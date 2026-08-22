@@ -132,7 +132,9 @@ describe('MCP transport over /mcp', () => {
     const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(u));
     await stub.bulkLoad([], [{ text: 'ancient covered detail about Cristi pricing', timestamp: now - 10 * DAY, models: ['coaching'] }]);
     const m = await stub.getModel('coaching');
-    await stub.insertSummary(m!.id, { tier: 0, text: 'Compressed arc: the Cristi engagement took shape.', startTimestamp: now - 10 * DAY, endTimestamp: now - 10 * DAY, sourceCount: 1 });
+    const covered = (await stub.listObservationsForModel(m!.id))[0]!;
+    await stub.insertSummary(m!.id, { tier: 0, text: 'Compressed arc: the Cristi engagement took shape.', startTimestamp: now - 10 * DAY, endTimestamp: now - 10 * DAY, sourceCount: 1 },
+      [{ type: 'observation', id: covered.id }]);
 
     await rpc(u, { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Fresh note recorded after the summary', models: ['coaching'] } } });
 
@@ -140,6 +142,41 @@ describe('MCP transport over /mcp', () => {
     const text = ((await res.json()) as RpcResponse).result.content[0].text;
     expect(text).toContain('Compressed arc');                       // summary carries the history
     expect(text).toContain('Fresh note recorded after the summary'); // unsummarized tail stays verbatim
-    expect(text).not.toContain('ancient covered detail');            // covered obs never repeats — not in the model view, not in Recent notes
+    // The covered observation still shows — as part of the resolution ramp, marked as such.
+    expect(text).toMatch(/· also summarized above\] ancient covered detail/);
+  });
+});
+
+describe('MCP — pyramid growth through the tools', () => {
+  it('record_observation triggers a bounded background advance; load_memory renders the cover + tail', async () => {
+    const u = user();
+    const stub = env.MEMORY_DO.get(env.MEMORY_DO.idFromName(u));
+    await stub.enableStubSynthesis();
+    await rpc(u, { jsonrpc: '2.0', id: 80, method: 'tools/call', params: { name: 'create_model', arguments: { name: 'proj', description: 'a project' } } });
+    for (let i = 0; i < 12; i++) {
+      await rpc(u, { jsonrpc: '2.0', id: 81, method: 'tools/call', params: { name: 'record_observation', arguments: { text: `note number ${i} about the project, distinct enough to pass dedup`, models: ['proj'] } } });
+    }
+    // The advance runs in the background (waitUntil); give it a moment, then also let load_memory trigger it.
+    for (let tries = 0; tries < 20; tries++) {
+      const m = await stub.getModel('proj');
+      if ((await stub.listAllSummariesForModel(m!.id)).length > 0) break;
+      await new Promise(r => setTimeout(r, 100));
+      await stub.maybeResummarize(['proj']);
+    }
+    const res = await rpc(u, { jsonrpc: '2.0', id: 82, method: 'tools/call', params: { name: 'load_memory', arguments: { topics: ['proj'] } } });
+    const text = ((await res.json()) as RpcResponse).result.content[0].text as string;
+    expect(text).toMatch(/\[tier 0 · 10 obs · \d{4}-\d{2}-\d{2}–\d{4}-\d{2}-\d{2}\]/); // cover label
+    expect(text).toContain('[stub tier0 tier 0 · 10 sources');                       // the summary text
+    expect(text).toContain('note number 10 about');                                     // tail verbatim
+    expect(text).toContain('note number 11 about');
+    // Recent notes (the block between its header and '# Loaded models') is the newest across models, covered or not.
+    const recent = text.slice(text.indexOf('# Recent notes'), text.indexOf('# Loaded models'));
+    expect(recent).toContain('note number 11 about');
+    expect(recent).toContain('note number 3 about');
+    // The model view's verbatim tail: the 2 uncovered + 3 covered (ramp, V=5), never the oldest.
+    const tail = text.slice(text.indexOf('Recent notes (verbatim):'));
+    expect(tail).toContain('note number 10 about');
+    expect(tail).toMatch(/also summarized above\] note number 9 about/);
+    expect(tail).not.toContain('note number 0 about');
   });
 });

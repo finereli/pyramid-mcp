@@ -94,8 +94,12 @@ async function main() {
 
   // Build the pyramid so integrative recall (model views) carries the arcs.
   console.log('building pyramid summaries…');
-  const rb = await fetch(`${BASE}/rebuild`, { method: 'POST', headers: { 'x-user-id': USER, 'x-openai-key': KEY } });
-  console.log('  ' + JSON.stringify(await rb.json()));
+  for (let round = 1; ; round++) {
+    const rb = await fetch(`${BASE}/advance`, { method: 'POST', headers: { 'x-user-id': USER, 'content-type': 'application/json' }, body: JSON.stringify({ maxCalls: 10 }) });
+    const r = (await rb.json()) as { tier0: number; rollups: number; remaining: boolean };
+    console.log(`  round ${round}: +${r.tier0} tier-0, +${r.rollups} rollups${r.remaining ? '' : ' — done'}`);
+    if (!r.remaining) break;
+  }
 
   const report: string[] = [`# pyramid-mcp recall eval\n\nSeed: 16 models, 1,727 observations (Glopus k111 carve). User: \`${USER}\`.\n`];
   let pass = 0, fail = 0;
