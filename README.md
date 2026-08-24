@@ -43,11 +43,14 @@ This is the memory architecture proven inside [Glopus](https://glopus.finereli.c
 
 ## Claude Code integration
 
-The server's MCP `instructions` tell the agent to call `load_memory` at
-conversation start and `record_observation` as it goes. That works, but it's a
-soft instruction - the model can forget or skip it.
+Loading memory is a two-step protocol: `load_memory` returns the model index
+and recent notes (the map), then `load_model` loads the models the agent picks
+from it (the memories). The server's MCP `instructions` teach this, and
+`record_observation` as the conversation goes. That works, but it's a soft
+instruction - the model can forget or skip it.
 
-Claude Code hooks make it guaranteed. A `SessionStart` hook calls `load_memory`
+Claude Code hooks make the start guaranteed. A `SessionStart` hook calls
+`load_memory` and then `load_model` with the always-useful seed models
 automatically before the first turn, using the `mcp_tool` hook type to invoke
 Pyramid directly - no model cooperation needed.
 
@@ -63,10 +66,17 @@ Add this to `~/.claude/settings.json`:
             "type": "mcp_tool",
             "server": "pyramid",
             "tool": "load_memory",
+            "input": {},
+            "statusMessage": "Loading memory map..."
+          },
+          {
+            "type": "mcp_tool",
+            "server": "pyramid",
+            "tool": "load_model",
             "input": {
-              "topics": ["user", "self", "memory"]
+              "models": ["user", "self", "memory"]
             },
-            "statusMessage": "Loading memory..."
+            "statusMessage": "Loading models..."
           }
         ]
       }
@@ -80,13 +90,13 @@ The `server` name must match your MCP server name (whatever you passed to
 `claude mcp add`). If you connected via a claude.ai connector, it's
 `"claude.ai Pyramid"`.
 
-**Topics:** Pyramid ships with five seed models - `user`, `self`, `system`,
+**Models:** Pyramid ships with five seed models - `user`, `self`, `system`,
 `world`, and `memory`. The three in the hook above are the most useful on every
 conversation: `user` loads context about the person you serve, `self` loads the
 agent's own identity and voice, and `memory` loads how the memory system works.
-The model sees the full model index in the response and can load more
-(project-specific models, people, etc.) once it knows what the conversation is
-about.
+The model sees the full model index from `load_memory` and calls `load_model`
+for more (project-specific models, people, etc.) once it knows what the
+conversation is about.
 
 **`autoMemoryEnabled: false`** disables Claude Code's built-in file-based memory
 system at the harness level. Without this, the system prompt includes lengthy
@@ -98,10 +108,11 @@ Then add to your `CLAUDE.md`:
 # Memory
 
 Use Pyramid MCP exclusively for long-term memory. A SessionStart hook
-auto-loads the user, self, and memory models. On your first turn, check
-the model index and call load_memory again with conversation-specific
-models if relevant. Record observations as you go - don't batch them for
-the end. Use recall to verify specific facts before stating them.
+auto-loads the model index plus the user, self, and memory models. On
+your first turn, check the index and call load_model with the models
+relevant to this conversation. Record observations as you go - don't
+batch them for the end. Use recall to verify specific facts before
+stating them.
 ```
 
 ## Develop
@@ -138,8 +149,8 @@ claude mcp add --transport http pyramid http://127.0.0.1:8787/mcp \
 ```
 
 Then ask Claude Code to recall a fact or load a topic — the server's MCP
-`instructions` tell the agent to `load_memory` at the start of a chat and
-`record_observation` as it goes.
+`instructions` tell the agent to `load_memory` + `load_model` at the start of
+a chat and `record_observation` as it goes.
 
 ## Eval
 

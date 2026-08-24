@@ -2,7 +2,7 @@
  * eval-recall.ts — the MVP acceptance gate. Loads the embedded Glopus seed into
  * a running pyramid-mcp (wrangler dev) and runs two recall suites end-to-end
  * through the real /mcp tools:
- *   - integrative recall via load_memory(model topics) → do model views carry the arcs?
+ *   - integrative recall via load_model(model names) → do model views carry the arcs?
  *   - direct recall via recall(query) → do the receipts (names, dates, numbers) come back?
  *
  * Produces hard assertions on a few high-confidence facts + a human-readable
@@ -108,7 +108,7 @@ async function main() {
   for (const query of QUERIES) {
     const text = query.kind === 'direct'
       ? await callTool('recall', { query: query.q })
-      : await callTool('load_memory', { topics: query.topics });
+      : await callTool('load_model', { models: query.topics });
 
     let verdict = '';
     if (query.expect) {

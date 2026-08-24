@@ -8,7 +8,7 @@
  * Task #3) — no external store, so 100% of a user's data lives in this object.
  *
  * This module owns the storage layer (schema + CRUD). The MCP transport,
- * embeddings, recall, summarization, and load_memory build on top of it in
+ * embeddings, recall, summarization, and the read tools (load_memory / load_model) build on top of it in
  * later tasks.
  */
 import { DurableObject } from 'cloudflare:workers';
@@ -217,11 +217,6 @@ export class MemoryDO extends DurableObject<Env> {
   /** Embed one text. Throws on failure; callers decide whether that's fatal. */
   embed(text: string): Promise<number[]> {
     return embedOne(this.env.AI, text);
-  }
-
-  /** Embed multiple texts in one round trip. */
-  embedMany(texts: string[]): Promise<number[][]> {
-    return embed(this.env.AI, texts);
   }
 
   /** Schedule async work that outlives the current request. */
@@ -526,7 +521,7 @@ export class MemoryDO extends DurableObject<Env> {
   }
 
   /**
-   * What load_memory renders for a model: the cover, plus a RESOLUTION RAMP so
+   * What load_model renders for a model: the cover, plus a RESOLUTION RAMP so
    * the recent past is never flatter than `ramp` tiles per tier and the last
    * `verbatim` observations are always shown raw — even when a higher tile
    * already covers them. Without the ramp the view collapses at a clean batch
@@ -719,7 +714,7 @@ export class MemoryDO extends DurableObject<Env> {
   }
 
   /**
-   * Request-path trigger (record_observation / load_memory). Advances each
+   * Request-path trigger (record_observation / load_model). Advances each
    * named model a bounded number of LLM calls in the background; a no-op in
    * the common case (two indexed queries). Failures are swallowed so recording
    * and loading never fail on synthesis.
@@ -902,7 +897,7 @@ export class MemoryDO extends DurableObject<Env> {
     }));
   }
 
-  /** What load_memory would render for a model (cover + ramp + tail), measured on the real view. */
+  /** What load_model would render for a model (cover + ramp + tail), measured on the real view. */
   private viewSize(modelId: string): { viewSummaries: number; viewObservations: number; viewChars: number; viewTokens: number } {
     const v = this.listViewForModel(modelId);
     const chars = v.summaries.reduce((n, s) => n + s.text.length, 0) + v.observations.reduce((n, o) => n + o.text.length, 0);

@@ -1,5 +1,5 @@
 /**
- * Pure formatters for the read side (recall + load_memory). No DB, no network —
+ * Pure formatters for the read side (recall + load_memory + load_model). No DB, no network —
  * unit-testable in isolation. These shape the text blocks the agent reads, and
  * carry the confidence-tier convention the `instructions` field explains.
  */
@@ -98,17 +98,10 @@ export function formatModelView(
   return parts.join('\n');
 }
 
-/** Observation-RAG receipts block for load_memory. */
-export function formatReceipts(matches: ObservationMatch[]): string {
-  if (matches.length === 0) return '';
-  const lines = matches.map(m => `- ${matchLabel(m)} ${m.text}`);
-  return `# Relevant receipts\n_Specific facts retrieved from memory — names, dates, numbers. Use as receipts, not a transcript._\n\n${lines.join('\n')}`;
-}
-
 /** The model index — every active model, for agent-as-router picks. */
 export function formatModelIndex(models: ModelRow[]): string {
   if (models.length === 0) return '';
   const sorted = [...models].sort((a, b) => a.name.localeCompare(b.name));
   const lines = sorted.map(m => `- ${m.name}: ${m.description ?? ''}`.trimEnd());
-  return `# Model index\n_The mental models available. Pass any of these names to load_memory to pull its view._\n\n${lines.join('\n')}`;
+  return `# Model index\n_The mental models available. Pass any of these names to load_model to pull its view._\n\n${lines.join('\n')}`;
 }

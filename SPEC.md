@@ -68,7 +68,7 @@ Derived sets, all per model and all by provenance:
 
 **Length.** Soft targets: tier 0 ~600 chars, tier 1 ~800, tier 2 ~1,000, tier 3+ ~1,200. Ceiling `max_tokens = target × 2.5 / 3.5`. Actual lengths are visible in `/admin/stats` and `memory_stats`; tuning is a process (see Roadmap).
 
-**Trigger.** `record_observation` calls `advancePyramid` in the background for every model it tagged; `load_memory` calls it for every model it loads. Each call does up to 4 LLM calls per model, so a request never waits on a long chain; a backlog catches up over a few interactions or all at once via `/admin/advance`. One advance per model runs at a time: a second caller awaits the running one and reports `remaining: true` with no work of its own. When there is nothing to do the cost is a handful of queries (the unsummarized scan loads observation text, so it is proportional to the tail - small once caught up).
+**Trigger.** `record_observation` calls `advancePyramid` in the background for every model it tagged; `load_model` calls it for every model it loads. Each call does up to 4 LLM calls per model, so a request never waits on a long chain; a backlog catches up over a few interactions or all at once via `/admin/advance`. One advance per model runs at a time: a second caller awaits the running one and reports `remaining: true` with no work of its own. When there is nothing to do the cost is a handful of queries (the unsummarized scan loads observation text, so it is proportional to the tail - small once caught up).
 
 **Embedding.** Every summary is embedded on insert; a failed embed is stored anyway and backfilled by `reembedBatch`, which covers observations and summaries.
 
@@ -101,18 +101,22 @@ Two prompts (`pyramid.ts`), both lens-aware, both stating the target length, bot
 
 ## 6. Reading
 
-### 6.1 load_memory
+### 6.1 load_memory + load_model
 
-The agent **is** the router: it has the user message in its own context and the model index in front of it, so it calls `load_memory` with short topics rather than the whole message. The response:
+Loading is a deliberate two-step protocol, and the agent **is** the router: it has the user message in its own context, so relevance inference stays with it, not with the memory.[^receipts]
+
+**`load_memory` (no arguments)** returns the map, never the memories:
 
 1. **Model index** - every active model with its description.
 2. **Recent notes** - the newest observations across all models, verbatim, newest first, capped by characters, whether or not a pyramid has covered them. The cross-conversation continuity substitute.[^stream][^recent]
-3. **Loaded models** - for each topic matching a model name: header and confidence meta (`[name · N obs · spans · latest]`), then the summaries oldest first, each labeled `[tier T · K sources · start–end]`, then recent observations verbatim oldest first. What is shown is the **cover plus a resolution ramp**: the cover (summaries nothing has rolled up) partitions the history exactly, and on top of it the view adds the newest `RAMP_PER_TIER` (2) summaries at every tier below the top even though a higher tile already covers them, and always the newest `RAMP_VERBATIM` (5) observations raw even when a tier-0 covers them. Ramp rows are labeled ("finer view of a period summarized above", "also summarized above") so the overlap is explicit. Reading this oldest-first gives old arcs at high tiers and progressively finer recent material - a resolution gradient that does not depend on where the observation count happens to fall.[^ramp] A generous per-model render budget (16K chars) guards against a pathological model with fill-down priority: top tier always, then newest lower summaries, then newest observations; whatever it cuts is still in the store.
-4. **Relevant receipts** - for topics that match no model, observation + summary RAG.
+
+The response ends by saying so in-band: nothing is loaded yet - pick the relevant models and call `load_model`. That visible incompleteness is the mechanism: an index alone is a menu, and a menu demands a pick.
+
+**`load_model(models[])`** loads the full view of the named models. Names are matched case-insensitively against the index; an unknown name returns an error with near-matches, never a silent fallback. For each model: header and confidence meta (`[name · N obs · spans · latest]`), then the summaries oldest first, each labeled `[tier T · K sources · start–end]`, then recent observations verbatim oldest first. What is shown is the **cover plus a resolution ramp**: the cover (summaries nothing has rolled up) partitions the history exactly, and on top of it the view adds the newest `RAMP_PER_TIER` (2) summaries at every tier below the top even though a higher tile already covers them, and always the newest `RAMP_VERBATIM` (5) observations raw even when a tier-0 covers them. Ramp rows are labeled ("finer view of a period summarized above", "also summarized above") so the overlap is explicit. Reading this oldest-first gives old arcs at high tiers and progressively finer recent material - a resolution gradient that does not depend on where the observation count happens to fall.[^ramp] A generous per-model render budget (16K chars) guards against a pathological model with fill-down priority: top tier always, then newest lower summaries, then newest observations; whatever it cuts is still in the store.
 
 No portrait.[^portrait] Sizing: at 500 observations a model's cover is ~2 tier-2 + ≤4 tier-1 + ≤4 tier-0 + the tail, roughly 15K chars / 4K tokens; a five-model load is ~20K tokens. Fine for a 1M-token model.
 
-Conversation start is driven by the MCP server `instructions` field (call `load_memory` first; record as you go; the confidence-metadata legend). A Claude Code `SessionStart` hook makes it guaranteed (README).
+Conversation start is driven by the MCP server `instructions` field (call `load_memory` first, then `load_model` with every relevant model; record as you go; the confidence-metadata legend). A Claude Code `SessionStart` hook makes it guaranteed (README).
 
 ### 6.2 recall
 
@@ -127,8 +131,9 @@ A bottom-up pyramid cannot know at tier-0 time which detail will matter later. H
 - `record_observation(text, models[])` - multi-tag, agent-authored, prefix-dedup within 24h. Rejects unknown model names. Triggers background pyramid growth; returns a **defrag hint** when the model index fragments (too many sparse models).
 - `create_model(name, description)` - upsert by name. `update_model_description`, `rename_model`, `archive_model` - maintenance; seeds protected. `fold(source, into, synthesis)` - record a synthesis observation into the target, archive the source.
 - `recall(query)` - §6.2.
-- `load_memory(topics[])` - §6.1; also triggers background growth for loaded models.
-- `memory_stats()` - counts, size distributions (chars and ~tokens), per-model rows including the unsummarized tail, top tier, and LOAD: what `load_memory` would render for the model (cover + ramp + tail), measured on the real view.
+- `load_memory()` - §6.1; the map: model index + recent notes, no arguments.
+- `load_model(models[])` - §6.1; the views; also triggers background growth for loaded models.
+- `memory_stats()` - counts, size distributions (chars and ~tokens), per-model rows including the unsummarized tail, top tier, and LOAD: what `load_model` would render for the model (cover + ramp + tail), measured on the real view.
 
 Recording threshold, by instruction rather than quota: *"Anything you don't record will be forgotten, so note down anything you might even remotely need to remember."* Observations are agent-authored, so this stays curated.
 
@@ -152,7 +157,7 @@ Schema changes and cleanup run in the DO constructor on first touch after deploy
 
 - Unit (`test/pyramid.test.ts`): batch rules, rollup at 5, prompt contents and provenance ids, target/ceiling relations, stub synthesis, render budget priority.
 - DO (`test/memory-do.test.ts`): exact-once provenance on 23/55/100-observation models, rollup builds only from summaries, tier 2 from tier 1 across separate runs (260 observations), rollups interleaved mid-backlog, immutability across repeated advances, `maxCalls` + `remaining` resume, once-per-model for multi-tagged observations, provenance mandatory, failed synthesis inserts nothing and resumes, degenerate output refused, in-flight guard under real overlap, `advanceAll` budget / archived models / per-model errors, `unsummarizeModel`, tail and recent-notes coverage by provenance, recall returns labeled summaries.
-- MCP (`test/mcp.test.ts`): tools/list, record/recall/load_memory shapes, `record_observation` → background advance → `load_memory` renders cover label + tail and recent notes exclude covered observations, `memory_stats`.
+- MCP (`test/mcp.test.ts`): tools/list, record/recall shapes, load_memory (map only, protocol footer), load_model (views, case-insensitive names, near-match errors), `record_observation` → background advance → `load_model` renders cover label + tail and `load_memory` recent notes include the newest regardless of coverage, `memory_stats`.
 - Arc-coverage (manual): for a model, sample facts from old observations; each must be in the cover or retrievable by `recall`. Run before and after prompt changes.
 - Recall eval (`scripts/eval-recall.ts`): seed a DO with the Glopus carve, advance, run the integrative and direct suites.
 
@@ -207,6 +212,8 @@ Cloudflare Workers + Durable Objects (SQLite) + Workers AI. MCP JSON-RPC (Stream
 [^portrait]: **A portrait per model (Glopus) - dropped, roadmap.** Glopus synthesizes one narrative per model from the cover so the main model reads one block. The argument for it: only something that knows the focal point (the present reinterprets the past) can compress aggressively, and the tiers don't know it. True - but the main model reading the cover *is* that something, and it reasons about relevance better than the synthesis model and can call `recall` for gaps, which frontier models do unprompted. With 1M-token contexts the token saving doesn't pay for the indirection, and a portrait that included the tail would need regeneration on every observation. Reversed during review of the plan; a retrieval-augmented portrait went with it.
 
 [^ramp]: **The cliff, and the ramp (from Angel).** Batches are anchored at each model's first observation and rollups fire at a fixed fan-in, so the non-overlapping cover collapses at a clean boundary: a model at 249 observations shows 4 tier-1 + 4 tier-0 + 9 raw, at 250 it shows one tier-2 summary and nothing else, at 251 that apex plus one note. The view oscillated with count, not importance - visible in the first post-migration stats, where `bizdev` loaded in 1.1K tokens and `yael` in 2.5K purely by phase. Angel's stream pyramid hit the same geometry and settled on render-time duplication: keep storage exact and immutable, and have the view top each tier up to its newest few tiles even when a coarser tile covers them. Adopted here with RAMP_PER_TIER = 2 (Angel uses a full complement of W; a full complement is the ceiling we'd see at the worst phase anyway) and RAMP_VERBATIM = 5. The alternative - lagging rollups so the cover itself keeps recent tiles - was rejected: it changes growth, leaves the apex cliff, and makes the store bend for the view. Recent notes had the same phase dependence (it showed only uncovered observations) and now simply shows the newest.
+
+[^receipts]: **Single-call load_memory with receipt RAG - dropped (Aug 24, 2026).** The original read entry point took `topics[]`: an exact model-name match loaded that view, and every other topic was embedded and answered with observation-RAG "receipts". In practice agents passed request-derived topics, almost never hit a model name exactly, read the receipts as the answer, and stopped - the response looked complete, so the intended second call with real model names never happened and the pyramid views went unread. An auto-routing fix (tally the model tags of the retrieved receipts and load the winning models) was rejected on philosophy: it moves relevance inference into the memory, and the model is smart, the memory is stupid. The fix was structural instead - split the call so the first response is visibly non-terminal: `load_memory` returns only the map, `load_model` returns the views, `recall` keeps the deep dive.
 
 [^recent]: **Synthesized `recent` model (Glopus) - roadmap.** Glopus keeps a 14-day cross-model window with its own pyramid and a recency-gradient prompt. pyramid-mcp's verbatim uncovered tail does the same job with no synthesis; revisit once the per-model pyramid has lived a while.
 
