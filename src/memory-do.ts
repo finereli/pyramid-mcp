@@ -316,6 +316,30 @@ export class MemoryDO extends DurableObject<Env> {
    * per model. Embedding (if provided) is stored inline as a blob; otherwise
    * the caller embeds asynchronously and calls setObservationEmbedding.
    */
+  /**
+   * Resolve agent-supplied model names to canonical index names: exact, then
+   * case-insensitive, then separator-insensitive ("yael-finer" → "yaelfiner").
+   * A normalized collision (two models differing only in separators) stays
+   * unresolved rather than guessing. Misses keep their original spelling.
+   */
+  resolveModelNames(names: string[]): { resolved: string[]; unknown: string[] } {
+    const models = this.listModels();
+    const byLower = new Map(models.map(m => [m.name.toLowerCase(), m.name]));
+    const byNorm = new Map<string, string | null>();
+    for (const m of models) {
+      const k = normName(m.name);
+      byNorm.set(k, byNorm.has(k) ? null : m.name);
+    }
+    const resolved: string[] = [];
+    const unknown: string[] = [];
+    for (const n of names) {
+      const hit = byLower.get(n.toLowerCase()) ?? byNorm.get(normName(n)) ?? null;
+      if (hit) { if (!resolved.includes(hit)) resolved.push(hit); }
+      else unknown.push(n);
+    }
+    return { resolved, unknown };
+  }
+
   addObservation(
     text: string,
     modelNames: string[],
@@ -1028,6 +1052,15 @@ export interface SizeStats {
 
 function placeholders(n: number): string {
   return Array.from({ length: n }, () => '?').join(',');
+}
+
+/**
+ * A name collapsed to bare alphanumerics — "yael-finer", "Yael Finer", and
+ * "yaelfiner" are all the same name. Separator conventions are the most common
+ * way an agent misses an exact match, and they carry no meaning worth failing on.
+ */
+export function normName(x: string): string {
+  return x.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
 function toModelRow(r: Record<string, unknown>): ModelRow {

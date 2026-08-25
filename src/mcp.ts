@@ -8,7 +8,7 @@
  * in-DO instance, so they're synchronous). Embedding goes through the DO's
  * `env.AI` binding (Workers AI bge-m3) — no per-user key, nothing to forward.
  */
-import type { MemoryDO } from './memory-do.js';
+import { normName, type MemoryDO } from './memory-do.js';
 import { formatRecall, formatRecentNotes, formatModelView, formatModelIndex } from './format.js';
 import { renderWithBudget } from './pyramid.js';
 
@@ -44,16 +44,26 @@ Bracketed metadata tells you how much backs a memory and how fresh it is — cal
 // ---------- Tool definitions ----------
 
 /**
- * Suggestions for a model name that missed the index: substring containment
- * either way, or a shared hyphen-token ("job-search" → "job-hunt"). Cheap and
- * good enough — the agent has the full index one load_memory call away.
+ * Suggestions for a model name that missed the index: normalized substring
+ * containment either way, a shared normalized prefix of 4+ chars
+ * ("yael-website" → "yaelfiner"), or a shared hyphen-token
+ * ("job-search" → "job-hunt"). Cheap and good enough — the agent has the
+ * full index one load_memory call away.
  */
 function nearMatches(query: string, names: string[]): string[] {
   const q = query.toLowerCase();
+  const qn = normName(query);
   const qTokens = q.split(/[^a-z0-9]+/).filter(Boolean);
+  const sharedPrefix = (a: string, b: string) => {
+    let i = 0;
+    while (i < a.length && i < b.length && a[i] === b[i]) i++;
+    return i;
+  };
   return names.filter(name => {
     const n = name.toLowerCase();
-    if (n.includes(q) || q.includes(n)) return true;
+    const nn = normName(name);
+    if (qn && (nn.includes(qn) || qn.includes(nn))) return true;
+    if (qn && sharedPrefix(qn, nn) >= 4) return true;
     return n.split(/[^a-z0-9]+/).filter(Boolean).some(t => qTokens.includes(t));
   });
 }
@@ -98,7 +108,19 @@ const TOOLS: ToolDef[] = [
       try { embedding = await memory.embed(text); }
       catch (e) { console.error('[record_observation] embed failed, storing without vector:', e); }
 
-      const res = memory.addObservation(text, models, 'direct', embedding);
+      // Separator/case variants resolve to canonical names; a genuine miss gets
+      // near-match suggestions BEFORE the create_model hint, so a typo doesn't
+      // grow a duplicate model.
+      const { resolved, unknown: unresolved } = memory.resolveModelNames(models);
+      if (unresolved.length > 0) {
+        const allNames = memory.listModels().map(m => m.name);
+        const lines = unresolved.map(n => {
+          const near = nearMatches(n, allNames);
+          return `Unknown model "${n}".${near.length > 0 ? ` Did you mean: ${near.join(', ')}?` : ''}`;
+        });
+        return `${lines.join('\n')}\nPick existing names from the model index, or call create_model if this is genuinely a new person, project, or topic.`;
+      }
+      const res = memory.addObservation(text, resolved, 'direct', embedding);
       if (!res.ok) {
         return `Unknown model name(s): ${res.unknown.join(', ')}. Call create_model first, or pick existing names from the model index.`;
       }
@@ -259,14 +281,14 @@ const TOOLS: ToolDef[] = [
       const names = Array.isArray(args.models) ? args.models.map(String).map(s => s.trim()).filter(Boolean) : [];
       if (names.length === 0) return 'Pass at least one model name from the model index (load_memory shows it).';
       const models = memory.listModels();
-      const byName = new Map(models.map(m => [m.name.toLowerCase(), m]));
+      const byName = new Map(models.map(m => [m.name, m]));
+      // Separator/case-insensitive resolution: "yael-finer" must find "yaelfiner".
+      const { resolved, unknown } = memory.resolveModelNames(names);
 
       const views: string[] = [];
       const loadedNames: string[] = [];
-      const unknown: string[] = [];
-      for (const n of names) {
-        const model = byName.get(n.toLowerCase());
-        if (!model) { unknown.push(n); continue; }
+      for (const name of resolved) {
+        const model = byName.get(name)!;
         if (loadedNames.includes(model.name)) continue;
         const conf = memory.getModelConfidence(model.id);
         // The cover (summaries not rolled into a higher one) plus the

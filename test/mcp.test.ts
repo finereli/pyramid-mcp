@@ -143,6 +143,29 @@ describe('MCP transport over /mcp', () => {
     expect(badText).toContain('call load_memory');
   });
 
+  it('separator variants resolve to the canonical model in load_model and record_observation', async () => {
+    const u = user();
+    await rpc(u, { jsonrpc: '2.0', id: 19, method: 'tools/call', params: { name: 'create_model', arguments: { name: 'yaelfiner', description: 'the website and PWA' } } });
+    await rpc(u, { jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Shipped the meditations page', models: ['yaelfiner'] } } });
+
+    // "yael-finer" is the same name in a different separator convention — it must load, not error.
+    const res = await rpc(u, { jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'load_model', arguments: { models: ['Yael-Finer'] } } });
+    const text = ((await res.json()) as RpcResponse).result.content[0].text;
+    expect(text).toContain('## yaelfiner');
+    expect(text).toContain('Shipped the meditations page');
+
+    // Recording through a variant tags the canonical model — no duplicate model, no error.
+    const rec = await rpc(u, { jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Yael approved the new empty state', models: ['yael_finer'] } } });
+    expect(((await rec.json()) as RpcResponse).result.content[0].text).toContain('Recorded against: yaelfiner');
+
+    // A genuine miss suggests near matches before inviting create_model.
+    const bad = await rpc(u, { jsonrpc: '2.0', id: 23, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'x', models: ['yael-website'] } } });
+    const badText = ((await bad.json()) as RpcResponse).result.content[0].text;
+    expect(badText).toContain('Unknown model "yael-website"');
+    expect(badText).toContain('Did you mean');
+    expect(badText).toContain('create_model');
+  });
+
   it('load_model shows summaries plus only the unsummarized verbatim tail', async () => {
     const u = user();
     const DAY = 86_400_000;
