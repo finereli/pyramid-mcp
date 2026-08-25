@@ -11,6 +11,13 @@ function isoDate(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
 
+/** Compact char counts for compression labels: 612, 1.0K, 61K. */
+function fmtChars(n: number): string {
+  if (n < 1000) return String(n);
+  const k = n / 1000;
+  return k >= 10 ? `${Math.round(k)}K` : `${k.toFixed(1)}K`;
+}
+
 /**
  * Confidence metadata for a model view: how much backs it and how fresh it is.
  * Ported from Glopus router.ts formatConfidenceMeta.
@@ -35,7 +42,8 @@ function matchLabel(m: ObservationMatch): string {
   if (m.kind === 'summary') {
     const start = m.startTimestamp ?? m.timestamp;
     const range = isoDate(start) === isoDate(m.timestamp) ? isoDate(m.timestamp) : `${isoDate(start)}–${isoDate(m.timestamp)}`;
-    return `[${range} · summary tier ${m.tier ?? 0}]`;
+    const backing = m.obsCount ? ` · ${m.obsCount} obs` : '';
+    return `[${range} · summary tier ${m.tier ?? 0}${backing}]`;
   }
   return `[${isoDate(m.timestamp)}]`;
 }
@@ -85,10 +93,13 @@ export function formatModelView(
   parts.push(formatConfidenceMeta(model.name, conf, now));
   // Chronological by start (ties: higher tier first), then recent verbatim notes.
   // Ramp rows (already covered by a tile above) say so, so the overlap is explicit.
+  // Label carries the TRANSITIVE backing (raw observations and their chars,
+  // through all tiers) plus the summary's own length — the compression ratio
+  // at a glance. Direct source counts are useless above tier 0 (always the
+  // fan-in); what calibrates confidence is how much was compressed away.
   for (const s of [...summaries].sort((a, b) => a.startTimestamp - b.startTimestamp || b.tier - a.tier)) {
-    const unit = s.tier === 0 ? 'obs' : `tier-${s.tier - 1} summaries`;
     const covered = s.covered ? ' · finer view of a period summarized above' : '';
-    parts.push(`\n[tier ${s.tier} · ${s.sourceCount} ${unit} · ${isoDate(s.startTimestamp)}–${isoDate(s.endTimestamp)}${covered}]\n${s.text}`);
+    parts.push(`\n[tier ${s.tier} · ${s.obsCount} obs · ${fmtChars(s.sourceChars)}→${fmtChars(s.text.length)} chars · ${isoDate(s.startTimestamp)}–${isoDate(s.endTimestamp)}${covered}]\n${s.text}`);
   }
   if (recentObs.length > 0) {
     const ordered = [...recentObs].sort((a, b) => a.timestamp - b.timestamp); // oldest→newest

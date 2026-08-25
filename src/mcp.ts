@@ -39,7 +39,7 @@ Use \`recall\` to dig into a specific question — names, dates, numbers, quotes
 
 Recording isn't only for fresh facts from the conversation. When something interesting surfaces — and especially when you reconstruct something from your own memory that you couldn't easily recall at first — it deserves an observation. The moment to write it is when a fuller picture finally coheres, which is often only after the user pushes past your first thin answer: capture that synthesis, and note that it was hard-won through active recollection. Skip the first shallow grab (it's noise); record the version that actually came together. Use your judgment on what counts as interesting — the point is that effortful reconstructions become cheap next time, and the threads the user keeps returning to get reinforced.
 
-Bracketed metadata like \`[client-cristi · 12 obs · spans 3mo · latest 2026-05-20]\` tells you how much backs a memory and how fresh it is — calibrate your confidence accordingly. Never mention models, clusters, or that memory was "loaded"; weave recollections in as your own knowing.`;
+Bracketed metadata tells you how much backs a memory and how fresh it is — calibrate your confidence accordingly. A model header like \`[client-cristi · 12 obs · spans 3mo · latest 2026-05-20]\` shows the whole model's backing; a summary label like \`[tier 2 · 47 obs · 61K→1.0K chars · 2026-02-17–2026-06-02]\` shows how many raw observations that one summary compresses and how much text they held versus what you're reading. The deeper the compression, the more an unstated specific needs \`recall\` before you assert it. Never mention models, clusters, or that memory was "loaded"; weave recollections in as your own knowing.`;
 
 // ---------- Tool definitions ----------
 

@@ -9,7 +9,7 @@ const NOW = Date.UTC(2026, 4, 30);
 const DAY = 86_400_000;
 const obs = (text: string, daysAgo: number): ObservationRow => ({ id: crypto.randomUUID(), text, timestamp: NOW - daysAgo * DAY, source: 'direct' });
 const sum = (tier: number, startDaysAgo: number, endDaysAgo: number, text = 'summary'): SummaryRow =>
-  ({ id: crypto.randomUUID(), tier, text, startTimestamp: NOW - startDaysAgo * DAY, endTimestamp: NOW - endDaysAgo * DAY, sourceCount: 5 });
+  ({ id: crypto.randomUUID(), tier, text, startTimestamp: NOW - startDaysAgo * DAY, endTimestamp: NOW - endDaysAgo * DAY, sourceCount: 5, obsCount: 5, sourceChars: 500 });
 const model: ModelRow = { id: 'm', name: 'cristi', description: 'The Cristi partnership', isSeed: false, archived: false, createdAt: NOW };
 
 describe('batchTier0', () => {

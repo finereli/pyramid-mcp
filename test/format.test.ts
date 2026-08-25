@@ -64,14 +64,14 @@ describe('formatModelIndex / formatModelView', () => {
       model,
       { obsCount: 30, earliest: NOW - 40 * DAY, latest: NOW },
       [
-        { id: 's1', tier: 1, text: 'old arc', startTimestamp: NOW - 40 * DAY, endTimestamp: NOW - 20 * DAY, sourceCount: 5 },
-        { id: 's0', tier: 0, text: 'recent batch', startTimestamp: NOW - 19 * DAY, endTimestamp: NOW - 2 * DAY, sourceCount: 10 },
+        { id: 's1', tier: 1, text: 'old arc', startTimestamp: NOW - 40 * DAY, endTimestamp: NOW - 20 * DAY, sourceCount: 5, obsCount: 50, sourceChars: 61234 },
+        { id: 's0', tier: 0, text: 'recent batch', startTimestamp: NOW - 19 * DAY, endTimestamp: NOW - 2 * DAY, sourceCount: 10, obsCount: 10, sourceChars: 1023 },
       ],
       [{ id: 'o1', text: 'fresh note', timestamp: NOW, source: 'direct' }],
       NOW,
     );
-    const i1 = out.indexOf('[tier 1 · 5 tier-0 summaries · 2026-04-20–2026-05-10]\nold arc');
-    const i0 = out.indexOf('[tier 0 · 10 obs · 2026-05-11–2026-05-28]\nrecent batch');
+    const i1 = out.indexOf('[tier 1 · 50 obs · 61K→7 chars · 2026-04-20–2026-05-10]\nold arc');
+    const i0 = out.indexOf('[tier 0 · 10 obs · 1.0K→12 chars · 2026-05-11–2026-05-28]\nrecent batch');
     const it = out.indexOf('Recent notes (verbatim):\n- [2026-05-30] fresh note');
     expect(i1).toBeGreaterThan(0);
     expect(i0).toBeGreaterThan(i1);

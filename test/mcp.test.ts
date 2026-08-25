@@ -187,7 +187,7 @@ describe('MCP — pyramid growth through the tools', () => {
     }
     const res = await rpc(u, { jsonrpc: '2.0', id: 82, method: 'tools/call', params: { name: 'load_model', arguments: { models: ['proj'] } } });
     const text = ((await res.json()) as RpcResponse).result.content[0].text as string;
-    expect(text).toMatch(/\[tier 0 · 10 obs · \d{4}-\d{2}-\d{2}–\d{4}-\d{2}-\d{2}\]/); // cover label
+    expect(text).toMatch(/\[tier 0 · 10 obs · [\d.]+K?→[\d.]+K? chars · \d{4}-\d{2}-\d{2}–\d{4}-\d{2}-\d{2}\]/); // cover label with transitive backing
     expect(text).toContain('[stub tier0 tier 0 · 10 sources');                       // the summary text
     expect(text).toContain('note number 10 about');                                     // tail verbatim
     expect(text).toContain('note number 11 about');

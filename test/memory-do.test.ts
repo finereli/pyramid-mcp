@@ -168,6 +168,8 @@ describe('pyramid — exact-once provenance, rollups, immutability (stub synthes
     const all = await u.listAllSummariesForModel(m.id);
     expect(all.length).toBe(2);
     expect(all.every(s => s.tier === 0 && s.sourceCount === 10)).toBe(true);
+    // Transitive stats at tier 0: the batch's own observations and their chars.
+    expect(all.every(s => s.obsCount === 10 && s.sourceChars > 0)).toBe(true);
 
     // Exact-once: 20 distinct observation ids across the two summaries; 3 left in the tail.
     const srcs = (await Promise.all(all.map(s => u.listSummarySources(s.id)))).flat();
@@ -194,6 +196,10 @@ describe('pyramid — exact-once provenance, rollups, immutability (stub synthes
     expect(srcs.length).toBe(5);
     expect(srcs.every(s => s.type === 'summary')).toBe(true);
     expect(t1[0]!.sourceCount).toBe(5);
+    // Transitive stats roll up: 5 tier-0s of 10 obs each, chars summed exactly.
+    expect(t1[0]!.obsCount).toBe(50);
+    const expectedChars = Array.from({ length: 50 }, (_, i) => `obs ${i} about the project`.length).reduce((a, b) => a + b, 0);
+    expect(t1[0]!.sourceChars).toBe(expectedChars);
     expect(t1[0]!.startTimestamp).toBe(Math.min(...all.filter(s => s.tier === 0).map(s => s.startTimestamp)));
 
     // The cover is the tier-1 summary alone (tier-0s are rolled up), plus the 5-obs tail.
