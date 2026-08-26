@@ -166,6 +166,31 @@ describe('MCP transport over /mcp', () => {
     expect(badText).toContain('create_model');
   });
 
+  it('load_model accepts singular "name"/"model" and bare-string "models" argument shapes', async () => {
+    const u = user();
+    await rpc(u, { jsonrpc: '2.0', id: 24, method: 'tools/call', params: { name: 'create_model', arguments: { name: 'yaelfiner', description: 'the website and PWA' } } });
+    await rpc(u, { jsonrpc: '2.0', id: 25, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Shipped the meditations page', models: ['yaelfiner'] } } });
+
+    // The shape from the bug report: {"name": "yaelfiner"} instead of {"models": [...]}.
+    for (const args of [{ name: 'yaelfiner' }, { model: 'yaelfiner' }, { models: 'yaelfiner' }]) {
+      const res = await rpc(u, { jsonrpc: '2.0', id: 26, method: 'tools/call', params: { name: 'load_model', arguments: args } });
+      const text = ((await res.json()) as RpcResponse).result.content[0].text;
+      expect(text).toContain('## yaelfiner');
+      expect(text).toContain('Shipped the meditations page');
+    }
+
+    // record_observation tolerates the same singular shape.
+    const rec = await rpc(u, { jsonrpc: '2.0', id: 27, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Yael wants offline mode next', model: 'yaelfiner' } } });
+    expect(((await rec.json()) as RpcResponse).result.content[0].text).toContain('Recorded against: yaelfiner');
+
+    // A call with no usable names says which arguments actually arrived.
+    const empty = await rpc(u, { jsonrpc: '2.0', id: 28, method: 'tools/call', params: { name: 'load_model', arguments: { foo: 'bar' } } });
+    const emptyText = ((await empty.json()) as RpcResponse).result.content[0].text;
+    expect(emptyText).toContain('No model names received');
+    expect(emptyText).toContain('"foo"');
+    expect(emptyText).toContain('"models"');
+  });
+
   it('load_model shows summaries plus only the unsummarized verbatim tail', async () => {
     const u = user();
     const DAY = 86_400_000;

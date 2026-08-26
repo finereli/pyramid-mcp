@@ -68,6 +68,32 @@ function nearMatches(query: string, names: string[]): string[] {
   });
 }
 
+/**
+ * Model names from tool arguments, leniently. The declared key is "models"
+ * (an array), but agents routinely send the shapes the sibling admin tools
+ * use — a singular "name"/"model" string — or a bare string under "models".
+ * The transport doesn't validate arguments against the schema, so before
+ * this those calls fell through to a generic "pass at least one model name"
+ * error that never named the actual mistake, and the load silently failed
+ * even when the model was in the index.
+ */
+function readModelNames(args: Record<string, unknown>): string[] {
+  const asNames = (v: unknown): string[] =>
+    (Array.isArray(v) ? v.map(String) : typeof v === 'string' ? [v] : []).map(s => s.trim()).filter(Boolean);
+  for (const key of ['models', 'model', 'names', 'name']) {
+    const got = asNames(args[key]);
+    if (got.length > 0) return got;
+  }
+  return [];
+}
+
+/** Error text for a call that carried no usable model names — names the keys that did arrive. */
+function noNamesError(args: Record<string, unknown>, usage: string): string {
+  const keys = Object.keys(args);
+  const received = keys.length > 0 ? ` (received argument${keys.length > 1 ? 's' : ''}: ${keys.map(k => `"${k}"`).join(', ')})` : '';
+  return `No model names received${received}. ${usage}`;
+}
+
 interface ToolDef {
   name: string;
   description: string;
@@ -98,9 +124,9 @@ const TOOLS: ToolDef[] = [
     },
     handler: async (memory, args) => {
       const text = String(args.text ?? '').trim();
-      const models = Array.isArray(args.models) ? args.models.map(String) : [];
+      const models = readModelNames(args);
       if (!text) return 'No observation text provided.';
-      if (models.length === 0) return 'No models provided. Pass at least one model name in "models".';
+      if (models.length === 0) return noNamesError(args, 'Pass "models": an array of model names from the model index.');
 
       // Embed first so the observation is immediately recallable. Cheap; if the
       // embed fails we still store it and it can be backfilled later.
@@ -278,8 +304,8 @@ const TOOLS: ToolDef[] = [
       required: ['models'],
     },
     handler: async (memory, args) => {
-      const names = Array.isArray(args.models) ? args.models.map(String).map(s => s.trim()).filter(Boolean) : [];
-      if (names.length === 0) return 'Pass at least one model name from the model index (load_memory shows it).';
+      const names = readModelNames(args);
+      if (names.length === 0) return noNamesError(args, 'Call with "models": an array of model names from the model index (load_memory shows it).');
       const models = memory.listModels();
       const byName = new Map(models.map(m => [m.name, m]));
       // Separator/case-insensitive resolution: "yael-finer" must find "yaelfiner".
