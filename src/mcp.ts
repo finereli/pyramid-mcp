@@ -8,8 +8,8 @@
  * in-DO instance, so they're synchronous). Embedding goes through the DO's
  * `env.AI` binding (Workers AI bge-m3) — no per-user key, nothing to forward.
  */
-import type { MemoryDO } from './memory-do.js';
-import { formatRecall, formatRecentNotes, formatModelView, formatReceipts, formatModelIndex } from './format.js';
+import { normName, type MemoryDO } from './memory-do.js';
+import { formatRecall, formatRecentNotes, formatModelView, formatModelIndex } from './format.js';
 import { renderWithBudget } from './pyramid.js';
 
 const RECALL_LIMIT = 15;
@@ -20,7 +20,6 @@ const RAMP_PER_TIER = 2;
 const RAMP_VERBATIM = 5;
 /** Per-model render budget (chars). Generous by design — it shapes a pathological view, it does not drop data from the store. */
 const MODEL_VIEW_BUDGET_CHARS = 16_000;
-const RAG_PER_TOPIC = 6;
 
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 const SERVER_INFO = { name: 'pyramid-mcp', version: '0.0.1' };
@@ -32,17 +31,54 @@ const SERVER_INFO = { name: 'pyramid-mcp', version: '0.0.1' };
  */
 export const SERVER_INSTRUCTIONS = `This server is your long-term memory.
 
-At the START of a conversation, call \`load_memory\` with the topics or questions relevant to what the user is raising — it returns the matching mental models plus recent notes.
+Loading memory takes TWO steps, always. At the START of a conversation, call \`load_memory\` — it returns the model index (the map of what this memory holds) and recent notes for continuity, but no memories themselves. Then read the index, pick every model relevant to what the user is raising, and call \`load_model\` once per model (the calls can run in parallel). A \`load_memory\` call on its own has loaded nothing; do not skip the second step. When the topic shifts mid-conversation, call \`load_model\` again for models that just became relevant.
 
 As the conversation unfolds, call \`record_observation\` for anything you might even remotely need to remember in a future conversation. Anything you don't record will be forgotten. Write in your own voice, like a diary — capture what mattered, what shifted, specific facts. Tag each observation with one or more models from the model index; call \`create_model\` when a genuinely new person, project, or topic emerges.
 
-Use \`recall\` to verify specific facts (names, dates, numbers, quotes) before stating them.
+Use \`recall\` to dig into a specific question — names, dates, numbers, quotes — before stating them as fact, and whenever a loaded model is too compressed to answer: each summary's label shows how many observations went into it, and a deep compression ratio means the detail you need lives below the summary, reachable only by \`recall\`.
 
 Recording isn't only for fresh facts from the conversation. When something interesting surfaces — and especially when you reconstruct something from your own memory that you couldn't easily recall at first — it deserves an observation. The moment to write it is when a fuller picture finally coheres, which is often only after the user pushes past your first thin answer: capture that synthesis, and note that it was hard-won through active recollection. Skip the first shallow grab (it's noise); record the version that actually came together. Use your judgment on what counts as interesting — the point is that effortful reconstructions become cheap next time, and the threads the user keeps returning to get reinforced.
 
-Bracketed metadata like \`[client-cristi · 12 obs · spans 3mo · latest 2026-05-20]\` tells you how much backs a memory and how fresh it is — calibrate your confidence accordingly. Never mention models, clusters, or that memory was "loaded"; weave recollections in as your own knowing.`;
+Bracketed metadata tells you how much backs a memory and how fresh it is — calibrate your confidence accordingly. A model header like \`[client-cristi · 12 obs · spans 3mo · latest 2026-05-20]\` shows the whole model's backing; a summary label like \`[tier 2 · 47 obs · 61K→1.0K chars · 2026-02-17–2026-06-02]\` shows how many raw observations that one summary compresses and how much text they held versus what you're reading. The deeper the compression, the more an unstated specific needs \`recall\` before you assert it. Never mention models, clusters, or that memory was "loaded"; weave recollections in as your own knowing.`;
 
 // ---------- Tool definitions ----------
+
+/**
+ * Suggestions for a model name that missed the index: normalized substring
+ * containment either way, a shared normalized prefix of 4+ chars
+ * ("yael-website" → "yaelfiner"), or a shared hyphen-token
+ * ("job-search" → "job-hunt"). Cheap and good enough — the agent has the
+ * full index one load_memory call away.
+ */
+function nearMatches(query: string, names: string[]): string[] {
+  const q = query.toLowerCase();
+  const qn = normName(query);
+  const qTokens = q.split(/[^a-z0-9]+/).filter(Boolean);
+  const sharedPrefix = (a: string, b: string) => {
+    let i = 0;
+    while (i < a.length && i < b.length && a[i] === b[i]) i++;
+    return i;
+  };
+  return names.filter(name => {
+    const n = name.toLowerCase();
+    const nn = normName(name);
+    if (qn && (nn.includes(qn) || qn.includes(nn))) return true;
+    if (qn && sharedPrefix(qn, nn) >= 4) return true;
+    return n.split(/[^a-z0-9]+/).filter(Boolean).some(t => qTokens.includes(t));
+  });
+}
+
+/**
+ * The transport doesn't validate arguments against the schema, so a call
+ * whose required argument is missing must fail with a message that names the
+ * expected key and the keys that actually arrived — a generic "pass a model
+ * name" left agents stuck when they'd used the wrong argument shape.
+ */
+function badArgsError(args: Record<string, unknown>, usage: string): string {
+  const keys = Object.keys(args);
+  const received = keys.length > 0 ? ` (received argument${keys.length > 1 ? 's' : ''}: ${keys.map(k => `"${k}"`).join(', ')})` : '';
+  return `${usage}${received}`;
+}
 
 interface ToolDef {
   name: string;
@@ -74,9 +110,9 @@ const TOOLS: ToolDef[] = [
     },
     handler: async (memory, args) => {
       const text = String(args.text ?? '').trim();
-      const models = Array.isArray(args.models) ? args.models.map(String) : [];
+      const models = Array.isArray(args.models) ? args.models.map(String).map(s => s.trim()).filter(Boolean) : [];
       if (!text) return 'No observation text provided.';
-      if (models.length === 0) return 'No models provided. Pass at least one model name in "models".';
+      if (models.length === 0) return badArgsError(args, 'No models provided. Pass "models": an array of model names from the model index.');
 
       // Embed first so the observation is immediately recallable. Cheap; if the
       // embed fails we still store it and it can be backfilled later.
@@ -84,7 +120,19 @@ const TOOLS: ToolDef[] = [
       try { embedding = await memory.embed(text); }
       catch (e) { console.error('[record_observation] embed failed, storing without vector:', e); }
 
-      const res = memory.addObservation(text, models, 'direct', embedding);
+      // Separator/case variants resolve to canonical names; a genuine miss gets
+      // near-match suggestions BEFORE the create_model hint, so a typo doesn't
+      // grow a duplicate model.
+      const { resolved, unknown: unresolved } = memory.resolveModelNames(models);
+      if (unresolved.length > 0) {
+        const allNames = memory.listModels().map(m => m.name);
+        const lines = unresolved.map(n => {
+          const near = nearMatches(n, allNames);
+          return `Unknown model "${n}".${near.length > 0 ? ` Did you mean: ${near.join(', ')}?` : ''}`;
+        });
+        return `${lines.join('\n')}\nPick existing names from the model index, or call create_model if this is genuinely a new person, project, or topic.`;
+      }
+      const res = memory.addObservation(text, resolved, 'direct', embedding);
       if (!res.ok) {
         return `Unknown model name(s): ${res.unknown.join(', ')}. Call create_model first, or pick existing names from the model index.`;
       }
@@ -215,77 +263,58 @@ const TOOLS: ToolDef[] = [
   {
     name: 'load_memory',
     description:
-      'Load relevant memory at the start of a conversation (or whenever the topic shifts). Pass the topics, people, projects, or questions in play — short tags, not the whole user message. Returns the model index (so you can pull more), recency-first recent notes (continuity), the full view of any topic that matches a model, and specific receipts retrieved for free-text topics. Call this early.',
+      'The entry point to memory — call at the start of every conversation, before anything else. Returns the model index (every mental model with its description) and recent notes (continuity across conversations). It loads no memories by itself: read the index, pick every model relevant to the conversation, and call load_model once per model (in parallel is fine). Loading memory always takes both steps.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async (memory) => {
+      const blocks: string[] = [formatModelIndex(memory.listModels())];
+      const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT));
+      if (recent) blocks.push(`# Recent notes\n_Newest first — continuity across recent conversations._\n\n${recent}`);
+      blocks.push('_This is the map, not the memory — nothing is loaded yet. Pick every model relevant to this conversation and call `load_model` for each one (parallel calls are fine)._');
+      return blocks.filter(Boolean).join('\n\n');
+    },
+  },
+  {
+    name: 'load_model',
+    description:
+      'Load the full view of one mental model from the index: the compressed history (summaries, older = more compressed) plus recent notes verbatim. Call right after load_memory, once per model relevant to the conversation (parallel calls are fine), and again whenever the topic shifts to a model you have not loaded. Each summary label shows how many observations went into it — when the compression is too deep for the specifics you need, drill in with recall.',
     inputSchema: {
       type: 'object',
       properties: {
-        topics: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'Topics/people/projects/questions relevant now. Names matching the model index load that model\'s view; free-text topics drive receipt retrieval.',
+        name: {
+          type: 'string',
+          description: 'Model name as it appears in the model index (load_memory shows it).',
         },
       },
-      required: ['topics'],
+      required: ['name'],
     },
     handler: async (memory, args) => {
-      const topics = Array.isArray(args.topics) ? args.topics.map(String).map(s => s.trim()).filter(Boolean) : [];
+      const name = typeof args.name === 'string' ? args.name.trim() : '';
+      if (!name) return badArgsError(args, 'Pass "name": a model name from the model index (load_memory shows it).');
       const models = memory.listModels();
-      const byName = new Map(models.map(m => [m.name, m]));
-
-      const blocks: string[] = [formatModelIndex(models)];
-
-      const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT));
-      if (recent) blocks.push(`# Recent notes\n_Newest first — continuity across recent conversations._\n\n${recent}`);
-
-      const ragTopics: string[] = [];
-      const views: string[] = [];
-      const loadedNames: string[] = [];
-      for (const t of topics) {
-        const model = byName.get(t);
-        if (model) {
-          const conf = memory.getModelConfidence(model.id);
-          // The cover (summaries not rolled into a higher one) plus the
-          // unsummarized tail partition the model's history exactly; the ramp
-          // adds the newest covered tiles so the recent past never goes flat
-          // at a batch boundary; a generous budget guards against a pathological model.
-          const raw = memory.listViewForModel(model.id, { ramp: RAMP_PER_TIER, verbatim: RAMP_VERBATIM, tailLimit: MODEL_VIEW_OBS });
-          const view = renderWithBudget(raw.summaries, raw.observations, MODEL_VIEW_BUDGET_CHARS);
-          views.push(formatModelView(model, conf, view.summaries, view.observations));
-          loadedNames.push(model.name);
-        } else {
-          ragTopics.push(t);
-        }
+      // Separator/case-insensitive resolution: "yael-finer" must find "yaelfiner".
+      const { resolved } = memory.resolveModelNames([name]);
+      if (resolved.length === 0) {
+        const near = nearMatches(name, models.map(m => m.name));
+        return `No model named "${name}".${near.length > 0 ? ` Closest by name: ${near.join(', ')}.` : ''}\nModel names must match the index — call load_memory to see it.`;
       }
-      if (views.length > 0) blocks.push(`# Loaded models\n\n${views.join('\n\n')}`);
+      const model = models.find(m => m.name === resolved[0])!;
+      const conf = memory.getModelConfidence(model.id);
+      // The cover (summaries not rolled into a higher one) plus the
+      // unsummarized tail partition the model's history exactly; the ramp
+      // adds the newest covered tiles so the recent past never goes flat
+      // at a batch boundary; a generous budget guards against a pathological model.
+      const raw = memory.listViewForModel(model.id, { ramp: RAMP_PER_TIER, verbatim: RAMP_VERBATIM, tailLimit: MODEL_VIEW_OBS });
+      const view = renderWithBudget(raw.summaries, raw.observations, MODEL_VIEW_BUDGET_CHARS);
       // Loading is also a growth trigger: catch up any pending tier-0 batches
       // or rollups in the background (bounded; a no-op when nothing's pending).
-      if (loadedNames.length > 0) memory.background(memory.maybeResummarize(loadedNames));
-
-      if (ragTopics.length > 0) {
-        try {
-          const vecs = await memory.embedMany(ragTopics);
-          const seen = new Set<string>();
-          const receipts = [] as ReturnType<MemoryDO['searchObservations']>;
-          for (const qv of vecs) {
-            for (const m of memory.searchObservations(qv, RAG_PER_TOPIC, 0.3)) {
-              if (!seen.has(m.id)) { seen.add(m.id); receipts.push(m); }
-            }
-          }
-          receipts.sort((a, b) => a.score - b.score);
-          const block = formatReceipts(receipts.slice(0, 12));
-          if (block) blocks.push(block);
-        } catch (e) {
-          console.error('[load_memory] rag embed failed:', e);
-        }
-      }
-
-      return blocks.filter(Boolean).join('\n\n');
+      memory.background(memory.maybeResummarize([model.name]));
+      return `# Loaded model\n\n${formatModelView(model, conf, view.summaries, view.observations)}`;
     },
   },
   {
     name: 'memory_stats',
     description:
-      'Size and shape of this memory store: counts of models, observations, and summaries, the text-length distribution of observations and summaries (min/max/mean/median/total chars, with a chars/4 token estimate), and per model what load_memory would actually render (cover summaries + verbatim tail). Read-only. Use when asked how big memory is, or to sanity-check growth.',
+      'Size and shape of this memory store: counts of models, observations, and summaries, the text-length distribution of observations and summaries (min/max/mean/median/total chars, with a chars/4 token estimate), and per model what load_model would actually render (cover summaries + verbatim tail). Read-only. Use when asked how big memory is, or to sanity-check growth.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (memory) => formatStats(memory.getStats()),
   },
@@ -391,7 +420,7 @@ function formatStats(st: ReturnType<MemoryDO['getStats']>): string {
     row('Summaries', st.summarySize),
     '(tokens ≈ chars / 4)',
     '',
-    'Per model (biggest first): obs (unsummarized tail) · obs chars/~tok · summaries (top tier) · all-summary chars/~tok · LOAD = what load_memory renders (cover + ramp summaries, tail + ramp obs) chars/~tok · span',
+    'Per model (biggest first): obs (unsummarized tail) · obs chars/~tok · summaries (top tier) · all-summary chars/~tok · LOAD = what load_model renders (cover + ramp summaries, tail + ramp obs) chars/~tok · span',
     ...st.perModel.map(m => {
       const flags = [m.seed ? 'seed' : '', m.archived ? 'archived' : ''].filter(Boolean).join(', ');
       const span = m.earliest && m.latest ? `${day(m.earliest)} → ${day(m.latest)}` : 'no observations';

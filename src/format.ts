@@ -1,5 +1,5 @@
 /**
- * Pure formatters for the read side (recall + load_memory). No DB, no network —
+ * Pure formatters for the read side (recall + load_memory + load_model). No DB, no network —
  * unit-testable in isolation. These shape the text blocks the agent reads, and
  * carry the confidence-tier convention the `instructions` field explains.
  */
@@ -9,6 +9,13 @@ const DAY_MS = 86_400_000;
 
 function isoDate(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
+}
+
+/** Compact char counts for compression labels: 612, 1.0K, 61K. */
+function fmtChars(n: number): string {
+  if (n < 1000) return String(n);
+  const k = n / 1000;
+  return k >= 10 ? `${Math.round(k)}K` : `${k.toFixed(1)}K`;
 }
 
 /**
@@ -35,7 +42,8 @@ function matchLabel(m: ObservationMatch): string {
   if (m.kind === 'summary') {
     const start = m.startTimestamp ?? m.timestamp;
     const range = isoDate(start) === isoDate(m.timestamp) ? isoDate(m.timestamp) : `${isoDate(start)}–${isoDate(m.timestamp)}`;
-    return `[${range} · summary tier ${m.tier ?? 0}]`;
+    const backing = m.obsCount ? ` · ${m.obsCount} obs` : '';
+    return `[${range} · summary tier ${m.tier ?? 0}${backing}]`;
   }
   return `[${isoDate(m.timestamp)}]`;
 }
@@ -85,10 +93,13 @@ export function formatModelView(
   parts.push(formatConfidenceMeta(model.name, conf, now));
   // Chronological by start (ties: higher tier first), then recent verbatim notes.
   // Ramp rows (already covered by a tile above) say so, so the overlap is explicit.
+  // Label carries the TRANSITIVE backing (raw observations and their chars,
+  // through all tiers) plus the summary's own length — the compression ratio
+  // at a glance. Direct source counts are useless above tier 0 (always the
+  // fan-in); what calibrates confidence is how much was compressed away.
   for (const s of [...summaries].sort((a, b) => a.startTimestamp - b.startTimestamp || b.tier - a.tier)) {
-    const unit = s.tier === 0 ? 'obs' : `tier-${s.tier - 1} summaries`;
     const covered = s.covered ? ' · finer view of a period summarized above' : '';
-    parts.push(`\n[tier ${s.tier} · ${s.sourceCount} ${unit} · ${isoDate(s.startTimestamp)}–${isoDate(s.endTimestamp)}${covered}]\n${s.text}`);
+    parts.push(`\n[tier ${s.tier} · ${s.obsCount} obs · ${fmtChars(s.sourceChars)}→${fmtChars(s.text.length)} chars · ${isoDate(s.startTimestamp)}–${isoDate(s.endTimestamp)}${covered}]\n${s.text}`);
   }
   if (recentObs.length > 0) {
     const ordered = [...recentObs].sort((a, b) => a.timestamp - b.timestamp); // oldest→newest
@@ -98,17 +109,10 @@ export function formatModelView(
   return parts.join('\n');
 }
 
-/** Observation-RAG receipts block for load_memory. */
-export function formatReceipts(matches: ObservationMatch[]): string {
-  if (matches.length === 0) return '';
-  const lines = matches.map(m => `- ${matchLabel(m)} ${m.text}`);
-  return `# Relevant receipts\n_Specific facts retrieved from memory — names, dates, numbers. Use as receipts, not a transcript._\n\n${lines.join('\n')}`;
-}
-
 /** The model index — every active model, for agent-as-router picks. */
 export function formatModelIndex(models: ModelRow[]): string {
   if (models.length === 0) return '';
   const sorted = [...models].sort((a, b) => a.name.localeCompare(b.name));
   const lines = sorted.map(m => `- ${m.name}: ${m.description ?? ''}`.trimEnd());
-  return `# Model index\n_The mental models available. Pass any of these names to load_memory to pull its view._\n\n${lines.join('\n')}`;
+  return `# Model index\n_The mental models available. Pass any of these names to load_model to pull its view._\n\n${lines.join('\n')}`;
 }
