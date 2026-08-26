@@ -54,6 +54,8 @@ describe('MCP transport over /mcp', () => {
     const rec = json.result.tools.find((t: any) => t.name === 'record_observation');
     expect(rec.inputSchema.required).toContain('text');
     expect(rec.inputSchema.required).toContain('models');
+    const load = json.result.tools.find((t: any) => t.name === 'load_model');
+    expect(load.inputSchema.required).toEqual(['name']);
   });
 
   it('create_model then record_observation (multi-tag), and rejects unknown models', async () => {
@@ -119,7 +121,7 @@ describe('MCP transport over /mcp', () => {
     expect(text).toContain('- coaching: coaching practice');
     expect(text).toContain('# Recent notes');
     expect(text).toContain('coaching call with Cristi'); // recent notes carry it — views don't
-    expect(text).not.toContain('# Loaded models');
+    expect(text).not.toContain('# Loaded model');
     expect(text).toContain('nothing is loaded yet');
     expect(text).toContain('load_model');
   });
@@ -129,14 +131,13 @@ describe('MCP transport over /mcp', () => {
     await rpc(u, { jsonrpc: '2.0', id: 15, method: 'tools/call', params: { name: 'create_model', arguments: { name: 'coaching', description: 'coaching practice' } } });
     await rpc(u, { jsonrpc: '2.0', id: 16, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Eli ran a strong coaching call with Cristi', models: ['coaching'] } } });
 
-    const res = await rpc(u, { jsonrpc: '2.0', id: 17, method: 'tools/call', params: { name: 'load_model', arguments: { models: ['Coaching', 'user'] } } });
+    const res = await rpc(u, { jsonrpc: '2.0', id: 17, method: 'tools/call', params: { name: 'load_model', arguments: { name: 'Coaching' } } });
     const text = ((await res.json()) as RpcResponse).result.content[0].text;
-    expect(text).toContain('# Loaded models');
+    expect(text).toContain('# Loaded model');
     expect(text).toContain('## coaching');
-    expect(text).toContain('## user');
     expect(text).toContain('coaching call with Cristi');
 
-    const bad = await rpc(u, { jsonrpc: '2.0', id: 18, method: 'tools/call', params: { name: 'load_model', arguments: { models: ['coaching-clients'] } } });
+    const bad = await rpc(u, { jsonrpc: '2.0', id: 18, method: 'tools/call', params: { name: 'load_model', arguments: { name: 'coaching-clients' } } });
     const badText = ((await bad.json()) as RpcResponse).result.content[0].text;
     expect(badText).toContain('No model named "coaching-clients"');
     expect(badText).toContain('Closest by name: coaching');
@@ -149,7 +150,7 @@ describe('MCP transport over /mcp', () => {
     await rpc(u, { jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Shipped the meditations page', models: ['yaelfiner'] } } });
 
     // "yael-finer" is the same name in a different separator convention — it must load, not error.
-    const res = await rpc(u, { jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'load_model', arguments: { models: ['Yael-Finer'] } } });
+    const res = await rpc(u, { jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'load_model', arguments: { name: 'Yael-Finer' } } });
     const text = ((await res.json()) as RpcResponse).result.content[0].text;
     expect(text).toContain('## yaelfiner');
     expect(text).toContain('Shipped the meditations page');
@@ -166,29 +167,28 @@ describe('MCP transport over /mcp', () => {
     expect(badText).toContain('create_model');
   });
 
-  it('load_model accepts singular "name"/"model" and bare-string "models" argument shapes', async () => {
+  it('load_model without "name" names the expected key and the arguments that arrived', async () => {
     const u = user();
     await rpc(u, { jsonrpc: '2.0', id: 24, method: 'tools/call', params: { name: 'create_model', arguments: { name: 'yaelfiner', description: 'the website and PWA' } } });
     await rpc(u, { jsonrpc: '2.0', id: 25, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Shipped the meditations page', models: ['yaelfiner'] } } });
 
-    // The shape from the bug report: {"name": "yaelfiner"} instead of {"models": [...]}.
-    for (const args of [{ name: 'yaelfiner' }, { model: 'yaelfiner' }, { models: 'yaelfiner' }]) {
-      const res = await rpc(u, { jsonrpc: '2.0', id: 26, method: 'tools/call', params: { name: 'load_model', arguments: args } });
-      const text = ((await res.json()) as RpcResponse).result.content[0].text;
-      expect(text).toContain('## yaelfiner');
-      expect(text).toContain('Shipped the meditations page');
-    }
+    const res = await rpc(u, { jsonrpc: '2.0', id: 26, method: 'tools/call', params: { name: 'load_model', arguments: { name: 'yaelfiner' } } });
+    const text = ((await res.json()) as RpcResponse).result.content[0].text;
+    expect(text).toContain('## yaelfiner');
+    expect(text).toContain('Shipped the meditations page');
 
-    // record_observation tolerates the same singular shape.
-    const rec = await rpc(u, { jsonrpc: '2.0', id: 27, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Yael wants offline mode next', model: 'yaelfiner' } } });
-    expect(((await rec.json()) as RpcResponse).result.content[0].text).toContain('Recorded against: yaelfiner');
+    // The transport doesn't schema-validate, so a wrong-shape call must get a
+    // self-correcting error: the expected key plus the keys that arrived.
+    const bad = await rpc(u, { jsonrpc: '2.0', id: 27, method: 'tools/call', params: { name: 'load_model', arguments: { models: ['yaelfiner'] } } });
+    const badText = ((await bad.json()) as RpcResponse).result.content[0].text;
+    expect(badText).toContain('Pass "name"');
+    expect(badText).toContain('received argument: "models"');
 
-    // A call with no usable names says which arguments actually arrived.
-    const empty = await rpc(u, { jsonrpc: '2.0', id: 28, method: 'tools/call', params: { name: 'load_model', arguments: { foo: 'bar' } } });
-    const emptyText = ((await empty.json()) as RpcResponse).result.content[0].text;
-    expect(emptyText).toContain('No model names received');
-    expect(emptyText).toContain('"foo"');
-    expect(emptyText).toContain('"models"');
+    // record_observation gives the same treatment for its "models" array.
+    const rec = await rpc(u, { jsonrpc: '2.0', id: 28, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Yael wants offline mode next', model: 'yaelfiner' } } });
+    const recText = ((await rec.json()) as RpcResponse).result.content[0].text;
+    expect(recText).toContain('Pass "models"');
+    expect(recText).toContain('"model"');
   });
 
   it('load_model shows summaries plus only the unsummarized verbatim tail', async () => {
@@ -208,7 +208,7 @@ describe('MCP transport over /mcp', () => {
 
     await rpc(u, { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Fresh note recorded after the summary', models: ['coaching'] } } });
 
-    const res = await rpc(u, { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'load_model', arguments: { models: ['coaching'] } } });
+    const res = await rpc(u, { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'load_model', arguments: { name: 'coaching' } } });
     const text = ((await res.json()) as RpcResponse).result.content[0].text;
     expect(text).toContain('Compressed arc');                       // summary carries the history
     expect(text).toContain('Fresh note recorded after the summary'); // unsummarized tail stays verbatim
@@ -233,7 +233,7 @@ describe('MCP — pyramid growth through the tools', () => {
       await new Promise(r => setTimeout(r, 100));
       await stub.maybeResummarize(['proj']);
     }
-    const res = await rpc(u, { jsonrpc: '2.0', id: 82, method: 'tools/call', params: { name: 'load_model', arguments: { models: ['proj'] } } });
+    const res = await rpc(u, { jsonrpc: '2.0', id: 82, method: 'tools/call', params: { name: 'load_model', arguments: { name: 'proj' } } });
     const text = ((await res.json()) as RpcResponse).result.content[0].text as string;
     expect(text).toMatch(/\[tier 0 · 10 obs · [\d.]+K?→[\d.]+K? chars · \d{4}-\d{2}-\d{2}–\d{4}-\d{2}-\d{2}\]/); // cover label with transitive backing
     expect(text).toContain('[stub tier0 tier 0 · 10 sources');                       // the summary text

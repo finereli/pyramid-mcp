@@ -44,8 +44,8 @@ This is the memory architecture proven inside [Glopus](https://glopus.finereli.c
 ## Claude Code integration
 
 Loading memory is a two-step protocol: `load_memory` returns the model index
-and recent notes (the map), then `load_model` loads the models the agent picks
-from it (the memories). The server's MCP `instructions` teach this, and
+and recent notes (the map), then `load_model` — one call per model the agent
+picks from it — loads the memories. The server's MCP `instructions` teach this, and
 `record_observation` as the conversation goes. That works, but it's a soft
 instruction - the model can forget or skip it.
 
@@ -73,10 +73,22 @@ Add this to `~/.claude/settings.json`:
             "type": "mcp_tool",
             "server": "pyramid",
             "tool": "load_model",
-            "input": {
-              "models": ["user", "self", "memory"]
-            },
-            "statusMessage": "Loading models..."
+            "input": { "name": "user" },
+            "statusMessage": "Loading user model..."
+          },
+          {
+            "type": "mcp_tool",
+            "server": "pyramid",
+            "tool": "load_model",
+            "input": { "name": "self" },
+            "statusMessage": "Loading self model..."
+          },
+          {
+            "type": "mcp_tool",
+            "server": "pyramid",
+            "tool": "load_model",
+            "input": { "name": "memory" },
+            "statusMessage": "Loading memory model..."
           }
         ]
       }
@@ -109,8 +121,9 @@ Then add to your `CLAUDE.md`:
 
 Use Pyramid MCP exclusively for long-term memory. A SessionStart hook
 auto-loads the model index plus the user, self, and memory models. On
-your first turn, check the index and call load_model with the models
-relevant to this conversation. Record observations as you go - don't
+your first turn, check the index and call load_model for each model
+relevant to this conversation (parallel calls are fine). Record
+observations as you go - don't
 batch them for the end. Use recall to verify specific facts before
 stating them.
 ```
