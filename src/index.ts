@@ -27,6 +27,13 @@ export interface Env {
   ADMIN_TOKEN?: string;
 }
 
+// Single-user server — no reason to force a monthly re-auth. The library's
+// default refreshTokenTTL is 30 days and doesn't slide on refresh, so it was
+// expiring on a fixed clock from whenever we last authorized. Set it to 10
+// years instead; revoke by clearing the grant from OAUTH_KV or revoking the
+// Google OAuth grant if that's ever needed.
+const TEN_YEARS_SECONDS = 10 * 365 * 24 * 60 * 60;
+
 const oauthProvider = new OAuthProvider({
   apiRoute: '/mcp',
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -37,6 +44,7 @@ const oauthProvider = new OAuthProvider({
   tokenEndpoint: '/token',
   clientRegistrationEndpoint: '/register',
   scopesSupported: ['memory'],
+  refreshTokenTTL: TEN_YEARS_SECONDS,
 });
 
 export default {
