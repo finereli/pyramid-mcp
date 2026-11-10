@@ -8,7 +8,7 @@
  * in-DO instance, so they're synchronous). Embedding goes through the DO's
  * `env.AI` binding (Workers AI bge-m3) — no per-user key, nothing to forward.
  */
-import { normName, type MemoryDO } from './memory-do.js';
+import { normName, type MemoryDO, type ModelRow } from './memory-do.js';
 import { formatRecall, formatRecentNotes, formatModelView, formatModelIndex } from './format.js';
 import { renderWithBudget } from './pyramid.js';
 
@@ -31,7 +31,7 @@ const SERVER_INFO = { name: 'pyramid-mcp', version: '0.0.1' };
  */
 export const SERVER_INSTRUCTIONS = `This server is your long-term memory.
 
-Loading memory takes TWO steps, always. At the START of a conversation, call \`load_memory\` — it returns the model index (the map of what this memory holds) and recent notes for continuity, but no memories themselves. Then read the index, pick every model relevant to what the user is raising, and call \`load_model\` once per model (the calls can run in parallel). A \`load_memory\` call on its own has loaded nothing; do not skip the second step. When the topic shifts mid-conversation, call \`load_model\` again for models that just became relevant.
+Loading memory takes TWO steps, always. At the START of a conversation, call \`load_memory\` — it returns the model index (the map of what this memory holds), recent notes for continuity, and the two core models, \`user\` and \`self\`, already loaded. Then read the index, pick every other model relevant to what the user is raising, and call \`load_model\` once per model (the calls can run in parallel). Beyond the core two, a \`load_memory\` call on its own has loaded nothing; do not skip the second step. When the topic shifts mid-conversation, call \`load_model\` again for models that just became relevant.
 
 As the conversation unfolds, call \`record_observation\` for anything you might even remotely need to remember in a future conversation. Anything you don't record will be forgotten. Write in your own voice, like a diary — capture what mattered, what shifted, specific facts. Tag each observation with one or more models from the model index; call \`create_model\` when a genuinely new person, project, or topic emerges.
 
@@ -78,6 +78,29 @@ function badArgsError(args: Record<string, unknown>, usage: string): string {
   const keys = Object.keys(args);
   const received = keys.length > 0 ? ` (received argument${keys.length > 1 ? 's' : ''}: ${keys.map(k => `"${k}"`).join(', ')})` : '';
   return `${usage}${received}`;
+}
+
+/**
+ * Models every conversation needs, whatever it's about: who the user is and
+ * who the agent is. load_memory renders them inline so they arrive with the
+ * map instead of depending on the agent to ask (a Claude Code SessionStart
+ * hook can force this; claude.ai and the desktop app have no hooks).
+ */
+export const CORE_MODELS: ReadonlyArray<string> = ['user', 'self'];
+
+/** One model's full view, as load_model returns it. Also a background growth trigger. */
+function renderLoadedModel(memory: MemoryDO, model: ModelRow): string {
+  const conf = memory.getModelConfidence(model.id);
+  // The cover (summaries not rolled into a higher one) plus the
+  // unsummarized tail partition the model's history exactly; the ramp
+  // adds the newest covered tiles so the recent past never goes flat
+  // at a batch boundary; a generous budget guards against a pathological model.
+  const raw = memory.listViewForModel(model.id, { ramp: RAMP_PER_TIER, verbatim: RAMP_VERBATIM, tailLimit: MODEL_VIEW_OBS });
+  const view = renderWithBudget(raw.summaries, raw.observations, MODEL_VIEW_BUDGET_CHARS);
+  // Loading is also a growth trigger: catch up any pending tier-0 batches
+  // or rollups in the background (bounded; a no-op when nothing's pending).
+  memory.background(memory.maybeResummarize([model.name]));
+  return `# Loaded model\n\n${formatModelView(model, conf, view.summaries, view.observations)}`;
 }
 
 interface ToolDef {
@@ -263,13 +286,19 @@ const TOOLS: ToolDef[] = [
   {
     name: 'load_memory',
     description:
-      'The entry point to memory — call at the start of every conversation, before anything else. Returns the model index (every mental model with its description) and recent notes (continuity across conversations). It loads no memories by itself: read the index, pick every model relevant to the conversation, and call load_model once per model (in parallel is fine). Loading memory always takes both steps.',
+      'The entry point to memory — call at the start of every conversation, before anything else. Returns the model index (every mental model with its description), recent notes (continuity across conversations), and the full views of the core models `user` and `self`. Every other model still needs loading: read the index, pick every model relevant to the conversation, and call load_model once per model (in parallel is fine). Loading memory always takes both steps.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (memory) => {
-      const blocks: string[] = [formatModelIndex(memory.listModels(), memory.modelActivity())];
+      const models = memory.listModels();
+      const blocks: string[] = [formatModelIndex(models, memory.modelActivity())];
       const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT));
       if (recent) blocks.push(`# Recent notes\n_Newest first — continuity across recent conversations._\n\n${recent}`);
-      blocks.push('_This is the map, not the memory — nothing is loaded yet. Pick every model relevant to this conversation and call `load_model` for each one (parallel calls are fine)._');
+      const core = CORE_MODELS.map(n => models.find(m => m.name === n)).filter((m): m is ModelRow => !!m);
+      for (const m of core) blocks.push(renderLoadedModel(memory, m));
+      const loaded = core.map(m => `\`${m.name}\``).join(' and ');
+      blocks.push(core.length > 0
+        ? `_Only ${loaded} ${core.length > 1 ? 'are' : 'is'} loaded (above). The rest of the index is the map, not the memory. Pick every other model relevant to this conversation and call \`load_model\` for each one (parallel calls are fine)._`
+        : '_This is the map, not the memory — nothing is loaded yet. Pick every model relevant to this conversation and call `load_model` for each one (parallel calls are fine)._');
       return blocks.filter(Boolean).join('\n\n');
     },
   },
@@ -298,17 +327,7 @@ const TOOLS: ToolDef[] = [
         return `No model named "${name}".${near.length > 0 ? ` Closest by name: ${near.join(', ')}.` : ''}\nModel names must match the index — call load_memory to see it.`;
       }
       const model = models.find(m => m.name === resolved[0])!;
-      const conf = memory.getModelConfidence(model.id);
-      // The cover (summaries not rolled into a higher one) plus the
-      // unsummarized tail partition the model's history exactly; the ramp
-      // adds the newest covered tiles so the recent past never goes flat
-      // at a batch boundary; a generous budget guards against a pathological model.
-      const raw = memory.listViewForModel(model.id, { ramp: RAMP_PER_TIER, verbatim: RAMP_VERBATIM, tailLimit: MODEL_VIEW_OBS });
-      const view = renderWithBudget(raw.summaries, raw.observations, MODEL_VIEW_BUDGET_CHARS);
-      // Loading is also a growth trigger: catch up any pending tier-0 batches
-      // or rollups in the background (bounded; a no-op when nothing's pending).
-      memory.background(memory.maybeResummarize([model.name]));
-      return `# Loaded model\n\n${formatModelView(model, conf, view.summaries, view.observations)}`;
+      return renderLoadedModel(memory, model);
     },
   },
   {

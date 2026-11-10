@@ -110,19 +110,24 @@ describe('MCP transport over /mcp', () => {
     expect(text).not.toContain('no embedding key');
   });
 
-  it('load_memory returns the map only — index, recent notes, and the protocol footer, no views', async () => {
+  it('load_memory returns the map plus the core user/self views — no other model views', async () => {
     const u = user();
     await rpc(u, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'create_model', arguments: { name: 'coaching', description: 'coaching practice' } } });
     await rpc(u, { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Eli ran a strong coaching call with Cristi', models: ['coaching', 'user'] } } });
+    await rpc(u, { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'record_observation', arguments: { text: 'Coaching rate settled at four hundred per session', models: ['coaching'] } } });
 
     const res = await rpc(u, { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'load_memory', arguments: {} } });
-    const text = ((await res.json()) as RpcResponse).result.content[0].text;
+    const text = ((await res.json()) as RpcResponse).result.content[0].text as string;
     expect(text).toContain('# Model index');
     expect(text).toContain('- coaching: coaching practice');
     expect(text).toContain('# Recent notes');
-    expect(text).toContain('coaching call with Cristi'); // recent notes carry it — views don't
-    expect(text).not.toContain('# Loaded model');
-    expect(text).toContain('nothing is loaded yet');
+    expect(text).toContain('coaching call with Cristi');
+    // The core models arrive loaded; nothing else does.
+    expect(text).toContain('## user — ');
+    expect(text).toContain('## self — ');
+    expect(text).not.toContain('## coaching — ');
+    expect(text.split('# Loaded model').length - 1).toBe(2);
+    expect(text).toContain('Only `user` and `self` are loaded');
     expect(text).toContain('load_model');
   });
 
