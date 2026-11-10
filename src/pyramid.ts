@@ -113,19 +113,30 @@ export interface SynthJob {
   sourceIds: string[];     // observation ids (tier0) or summary ids (rollup)
 }
 
-export function buildTier0Job(model: ModelRow, batch: ObservationRow[]): SynthJob {
+/** Marks an observation a later note corrected, in the tier-0 prompt. */
+export const SUPERSEDED_MARK = '(SUPERSEDED: a later note corrected this)';
+
+/**
+ * Every observation is summarized exactly once, superseded or not; a
+ * superseded one goes in marked, so the summary can keep it as history
+ * ("first tried X") without presenting it as the current state.
+ */
+export function buildTier0Job(model: ModelRow, batch: ObservationRow[], superseded: ReadonlySet<string> = new Set()): SynthJob {
   const sorted = [...batch].sort((a, b) => a.timestamp - b.timestamp);
   const startTs = sorted[0]!.timestamp;
   const endTs = sorted[sorted.length - 1]!.timestamp;
   const target = targetCharsForTier(0);
-  const body = sorted.map(o => `- [${isoDate(o.timestamp)}] ${o.text}`).join('\n');
+  const body = sorted.map(o => `- [${isoDate(o.timestamp)}] ${superseded.has(o.id) ? `${SUPERSEDED_MARK} ` : ''}${o.text}`).join('\n');
+  const note = sorted.some(o => superseded.has(o.id))
+    ? `\nObservations marked ${SUPERSEDED_MARK} were later corrected or replaced. Don't present them as current; mention them only as history if they matter to the arc.\n`
+    : '';
   const user = `Model: ${model.name}
 Purpose: ${model.description ?? model.name}
 Window: ${rangeLabel(startTs, endTs)} (${sorted.length} observations)
 
 Observations, oldest first:
 ${body}
-
+${note}
 Write a ~${target}-character tier-0 summary of this window through the "${model.name}" lens.`;
   return { kind: 'tier0', tier: 0, system: TIER0_SYSTEM, user, maxTokens: ceilingTokensForTier(0), targetChars: target, startTs, endTs, sourceIds: sorted.map(o => o.id) };
 }

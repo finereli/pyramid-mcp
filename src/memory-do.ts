@@ -85,6 +85,7 @@ export interface ObservationMatch {
   tier?: number;         // summaries only
   startTimestamp?: number; // summaries only
   obsCount?: number;     // summaries only: raw observations behind it, through all tiers
+  supersededBy?: { timestamp: number; text: string }; // observations only: a later note corrected this one
 }
 
 export interface SummarySource { type: 'observation' | 'summary'; id: string }
@@ -102,6 +103,11 @@ export function checkSynthOutput(text: string): string {
   if (t.length < MIN_SUMMARY_CHARS) throw new Error(`synthesis returned degenerate output (${t.length} chars)`);
   return t;
 }
+
+/** Minimum quote length for finding a note to supersede; shorter quotes match too much. */
+export const MIN_QUOTE_CHARS = 12;
+/** Recall ranks a superseded note below its live neighbours by this much (scores are 0..~1, lower = better). */
+const SUPERSEDED_PENALTY = 0.1;
 
 const DEDUP_WINDOW_MS = 24 * 3600 * 1000;
 const DEDUP_PREFIX_CHARS = 80;
@@ -171,6 +177,11 @@ export class MemoryDO extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS idx_ss_source ON summary_sources(source_type, source_id);
       CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE IF NOT EXISTS supersessions (
+        old_id    TEXT PRIMARY KEY,
+        new_id    TEXT NOT NULL,
+        timestamp INTEGER NOT NULL
+      );
     `);
     // Add columns introduced after the initial schema, for DOs created earlier.
     try { this.sql.exec('ALTER TABLE models ADD COLUMN last_summarized_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already present */ }
@@ -414,6 +425,58 @@ export class MemoryDO extends DurableObject<Env> {
     return { models: models.length, observations: oCount, tags: tCount };
   }
 
+  // ---------- Supersession (corrections) ----------
+  //
+  // Observations are never edited or deleted. A correction is a NEW
+  // observation plus a supersessions row pointing old → new. The old note
+  // stays in the store and in recall (labeled), but drops out of everything
+  // that presents memory as current: recent notes, the verbatim tail of a
+  // model view, and — marked as history — the tier-0 prompt that compresses it.
+
+  /**
+   * Live (not yet superseded) observations containing `quote`, case-insensitive,
+   * newest first. How the agent points at an old note without seeing ids.
+   */
+  findObservationsByQuote(quote: string, limit = 5): ObservationRow[] {
+    const rows = this.sql.exec(
+      `SELECT id, text, timestamp, source FROM observations
+       WHERE instr(lower(text), lower(?)) > 0
+         AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)
+       ORDER BY timestamp DESC, rowid DESC LIMIT ?`,
+      quote, limit,
+    ).toArray() as Array<Record<string, unknown>>;
+    return rows.map(toObservationRow);
+  }
+
+  /** Mark old observations as superseded by a newer one. Idempotent per old id (first correction wins). */
+  markSuperseded(oldIds: string[], newId: string): number {
+    let n = 0;
+    for (const old of oldIds) {
+      if (old === newId) continue;
+      n += this.sql.exec('INSERT OR IGNORE INTO supersessions (old_id, new_id, timestamp) VALUES (?, ?, ?)', old, newId, Date.now()).rowsWritten;
+    }
+    return n;
+  }
+
+  /** Which of these observation ids are superseded. */
+  supersededAmong(ids: string[]): Set<string> {
+    if (ids.length === 0) return new Set();
+    const rows = this.sql.exec(`SELECT old_id FROM supersessions WHERE old_id IN (${placeholders(ids.length)})`, ...ids)
+      .toArray() as Array<{ old_id: string }>;
+    return new Set(rows.map(r => r.old_id));
+  }
+
+  /** For recall labels: when each superseded id was replaced, and by what. */
+  supersessionInfo(ids: string[]): Map<string, { timestamp: number; text: string }> {
+    if (ids.length === 0) return new Map();
+    const rows = this.sql.exec(
+      `SELECT sp.old_id, sp.timestamp, o.text FROM supersessions sp JOIN observations o ON o.id = sp.new_id
+       WHERE sp.old_id IN (${placeholders(ids.length)})`,
+      ...ids,
+    ).toArray() as Array<{ old_id: string; timestamp: number; text: string }>;
+    return new Map(rows.map(r => [r.old_id, { timestamp: r.timestamp, text: r.text }]));
+  }
+
   setObservationEmbedding(observationId: string, embedding: number[]): void {
     this.sql.exec('UPDATE observations SET embedding = ? WHERE id = ?', floatsToBlob(normalizeVec(embedding)), observationId);
   }
@@ -450,7 +513,12 @@ export class MemoryDO extends DurableObject<Env> {
     const obs = this.sql
       .exec('SELECT id, text, timestamp, embedding FROM observations WHERE embedding IS NOT NULL')
       .toArray() as Array<{ id: string; text: string; timestamp: number; embedding: ArrayBuffer }>;
-    const scored: ObservationMatch[] = obs.map(r => ({ id: r.id, text: r.text, timestamp: r.timestamp, score: score(r.embedding, r.timestamp), kind: 'observation' as const }));
+    const superseded = new Set((this.sql.exec('SELECT old_id FROM supersessions').toArray() as Array<{ old_id: string }>).map(r => r.old_id));
+    const scored: ObservationMatch[] = obs.map(r => ({
+      id: r.id, text: r.text, timestamp: r.timestamp, kind: 'observation' as const,
+      // Corrections outrank what they corrected; the old note stays findable.
+      score: score(r.embedding, r.timestamp) + (superseded.has(r.id) ? SUPERSEDED_PENALTY : 0),
+    }));
 
     if (includeSummaries) {
       // Arcs, not just receipts: summaries are searchable too. Recency uses the
@@ -463,7 +531,13 @@ export class MemoryDO extends DurableObject<Env> {
       }
     }
     scored.sort((a, b) => a.score - b.score);
-    return scored.slice(0, limit);
+    const top = scored.slice(0, limit);
+    const info = this.supersessionInfo(top.filter(m => m.kind === 'observation' && superseded.has(m.id)).map(m => m.id));
+    for (const m of top) {
+      const s = info.get(m.id);
+      if (s) m.supersededBy = s;
+    }
+    return top;
   }
 
   /** Prefix-match dedup against observations from the last 24h. */
@@ -563,9 +637,15 @@ export class MemoryDO extends DurableObject<Env> {
     return rows.map(toSummaryRow);
   }
 
-  /** The verbatim tail for the read path: the model's newest unsummarized observations, newest first. */
+  /**
+   * The verbatim tail for the read path: the model's newest unsummarized
+   * observations, newest first. Superseded notes are left out — the view
+   * presents memory as current, and the correction is in the tail instead.
+   */
   listTailForModel(modelId: string, limit: number): ObservationRow[] {
-    return this.unsummarizedObservations(modelId).slice(-limit).reverse();
+    const unsummarized = this.unsummarizedObservations(modelId);
+    const superseded = this.supersededAmong(unsummarized.map(o => o.id));
+    return unsummarized.filter(o => !superseded.has(o.id)).slice(-limit).reverse();
   }
 
   /**
@@ -604,6 +684,7 @@ export class MemoryDO extends DurableObject<Env> {
          WHERE t.model_id = ?
            AND EXISTS (SELECT 1 FROM summary_sources ss JOIN summaries s ON s.id = ss.summary_id
                        WHERE ss.source_type = 'observation' AND ss.source_id = o.id AND s.model_id = ?)
+           AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = o.id)
          ORDER BY o.timestamp DESC, o.rowid DESC LIMIT ?`,
         modelId, modelId, need,
       ).toArray() as Array<Record<string, unknown>>;
@@ -751,7 +832,7 @@ export class MemoryDO extends DurableObject<Env> {
     const { batches } = batchTier0(this.unsummarizedObservations(modelId));
     for (const batch of batches) {
       if (calls >= maxCalls) { result.remaining = true; return result; }
-      const job = buildTier0Job(model, batch);
+      const job = buildTier0Job(model, batch, this.supersededAmong(batch.map(o => o.id)));
       const text = checkSynthOutput(await this.runSynth(job)); calls++;
       await this.insertSummary(modelId, { tier: 0, text, startTimestamp: job.startTs, endTimestamp: job.endTs, sourceCount: job.sourceIds.length },
         job.sourceIds.map(id => ({ type: 'observation' as const, id })));
@@ -836,7 +917,9 @@ export class MemoryDO extends DurableObject<Env> {
    */
   recentObservations(limit = 30): ObservationRow[] {
     const rows = this.sql.exec(
-      'SELECT id, text, timestamp, source FROM observations ORDER BY timestamp DESC, rowid DESC LIMIT ?',
+      `SELECT id, text, timestamp, source FROM observations
+       WHERE NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)
+       ORDER BY timestamp DESC, rowid DESC LIMIT ?`,
       limit,
     ).toArray() as Array<Record<string, unknown>>;
     return rows.map(toObservationRow);
@@ -1028,6 +1111,7 @@ export class MemoryDO extends DurableObject<Env> {
     this.sql.exec('DELETE FROM summaries');
     this.sql.exec('DELETE FROM models');
     this.sql.exec('DELETE FROM config');
+    this.sql.exec('DELETE FROM supersessions');
     this.ensureSeedModels();
     return { cleared: true };
   }

@@ -35,9 +35,11 @@ observation_tags  observation_id, model_id
 summaries         id, model_id, tier, text, start_timestamp, end_timestamp, source_count, is_dirty (unused), embedding
 summary_sources   summary_id, source_type ('observation' | 'summary'), source_id
 config            key, value
+supersessions     old_id, new_id, timestamp
 ```
 
 - An **observation** is a short agent-authored note, tagged to one or more models. Observations are never edited or deleted by the system.[^dirty]
+- A **supersession** says a later observation corrects an earlier one (`record_observation(..., supersedes: [quote])`). Neither observation changes; the row only changes how the old one is *presented*. It drops out of everything that reads as current memory (recent notes, a model view's verbatim tail and ramp), goes into its tier-0 batch marked `(SUPERSEDED: ...)` so the summary keeps it only as history, and stays in `recall` ranked down by 0.1 and labeled with when and by what it was replaced. The agent points at the old note with a quote, not an id (ids are never shown): the quote must match exactly one live note case-insensitively, or nothing is recorded. Summaries already written from the old note are immutable and stay as they are; the correction reaches the view as a newer note. Without this, a day of back-and-forth (four notes about a layout, each reversing the last) left every stale instruction alive and equally weighted.
 - A **model** is a mental model - a person, project, topic, or facet. Five seed models (`self`, `user`, `system`, `world`, `memory`) are protected from archive and rename.
 - A **summary** is one node of a model's pyramid. `tier` is **depth**: 0 = built from observations, 1 = built from tier-0 summaries, and so on.[^tiername] `summary_sources` records exactly which observations (tier 0) or summaries (tier N+1) it was built from. A summary without sources is invalid and is deleted on DO start.[^legacy]
 
@@ -130,7 +132,7 @@ A bottom-up pyramid cannot know at tier-0 time which detail will matter later. H
 
 ## 7. Tool surface (MCP)
 
-- `record_observation(text, models[])` - multi-tag, agent-authored, prefix-dedup within 24h. Rejects unknown model names. Triggers background pyramid growth; returns a **defrag hint** when the model index fragments (too many sparse models).
+- `record_observation(text, models[], supersedes?[])` - multi-tag, agent-authored, prefix-dedup within 24h; `supersedes` quotes earlier notes this one corrects (§4). Rejects unknown model names. Triggers background pyramid growth; returns a **defrag hint** when the model index fragments (too many sparse models).
 - `create_model(name, description)` - upsert by name. `update_model_description`, `rename_model`, `archive_model` - maintenance; seeds protected. `fold(source, into, synthesis)` - record a synthesis observation into the target, archive the source.
 - `recall(query)` - §6.2.
 - `load_memory()` - §6.1; the map: model index + recent notes, no arguments.

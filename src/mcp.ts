@@ -8,7 +8,7 @@
  * in-DO instance, so they're synchronous). Embedding goes through the DO's
  * `env.AI` binding (Workers AI bge-m3) — no per-user key, nothing to forward.
  */
-import { normName, type MemoryDO, type ModelRow } from './memory-do.js';
+import { normName, MIN_QUOTE_CHARS, type MemoryDO, type ModelRow } from './memory-do.js';
 import { formatRecall, formatRecentNotes, formatModelView, formatModelIndex } from './format.js';
 import { renderWithBudget } from './pyramid.js';
 
@@ -33,7 +33,7 @@ export const SERVER_INSTRUCTIONS = `This server is your long-term memory.
 
 Loading memory takes TWO steps, always. At the START of a conversation, call \`load_memory\` — it returns the model index (the map of what this memory holds), recent notes for continuity, and the two core models, \`user\` and \`self\`, already loaded. Then read the index, pick every other model relevant to what the user is raising, and call \`load_model\` once per model (the calls can run in parallel). Beyond the core two, a \`load_memory\` call on its own has loaded nothing; do not skip the second step. When the topic shifts mid-conversation, call \`load_model\` again for models that just became relevant.
 
-As the conversation unfolds, call \`record_observation\` for anything you might even remotely need to remember in a future conversation. Anything you don't record will be forgotten. Write in your own voice, like a diary — capture what mattered, what shifted, specific facts. Tag each observation with one or more models from the model index; call \`create_model\` when a genuinely new person, project, or topic emerges.
+As the conversation unfolds, call \`record_observation\` for anything you might even remotely need to remember in a future conversation. Anything you don't record will be forgotten. Write in your own voice, like a diary — capture what mattered, what shifted, specific facts. Tag each observation with one or more models from the model index; call \`create_model\` when a genuinely new person, project, or topic emerges. When a new observation corrects or replaces an earlier one (a reversed decision, a fixed mistake, a setting changed back), pass \`supersedes\` with a distinctive quote from each old note, so the old instruction stops reading as current.
 
 Use \`recall\` to dig into a specific question — names, dates, numbers, quotes — before stating them as fact, and whenever a loaded model is too compressed to answer: each summary's label shows how many observations went into it, and a deep compression ratio means the detail you need lives below the summary, reachable only by \`recall\`.
 
@@ -128,6 +128,11 @@ const TOOLS: ToolDef[] = [
           minItems: 1,
           description: 'Names of the models this observation belongs to, exactly as listed in the model index. Multiple is encouraged when it genuinely belongs in more than one lens.',
         },
+        supersedes: {
+          type: 'array',
+          items: { type: 'string' },
+          description: `Optional. When this observation corrects or replaces earlier notes (a reversed decision, a fixed mistake, a setting changed back), quote a distinctive phrase (${MIN_QUOTE_CHARS}+ characters, exactly as written) from each old note. Those notes stop appearing as current memory; recall still finds them, labeled as superseded. Nothing is recorded if a quote matches no note or more than one.`,
+        },
       },
       required: ['text', 'models'],
     },
@@ -136,6 +141,21 @@ const TOOLS: ToolDef[] = [
       const models = Array.isArray(args.models) ? args.models.map(String).map(s => s.trim()).filter(Boolean) : [];
       if (!text) return 'No observation text provided.';
       if (models.length === 0) return badArgsError(args, 'No models provided. Pass "models": an array of model names from the model index.');
+
+      // Resolve every supersedes quote to exactly one live note BEFORE writing
+      // anything — a half-applied correction is worse than none.
+      const quotes = Array.isArray(args.supersedes) ? args.supersedes.map(String).map(s => s.trim()).filter(Boolean) : [];
+      const supersedeIds: string[] = [];
+      const quoteErrors: string[] = [];
+      for (const q of quotes) {
+        if (q.length < MIN_QUOTE_CHARS) { quoteErrors.push(`Quote "${q}" is too short; use ${MIN_QUOTE_CHARS}+ characters.`); continue; }
+        const hits = memory.findObservationsByQuote(q, 5);
+        if (hits.length === 0) quoteErrors.push(`No current note contains "${q}". Quote it exactly as written (recall can find it).`);
+        else if (hits.length > 1) {
+          quoteErrors.push(`"${q}" matches ${hits.length === 5 ? '5+' : hits.length} notes; quote more of the one you mean:\n${hits.map(h => `  - [${day(h.timestamp)}] ${h.text.slice(0, 140)}${h.text.length > 140 ? '…' : ''}`).join('\n')}`);
+        } else if (!supersedeIds.includes(hits[0]!.id)) supersedeIds.push(hits[0]!.id);
+      }
+      if (quoteErrors.length > 0) return `${quoteErrors.join('\n')}\nNothing was recorded.`;
 
       // Embed first so the observation is immediately recallable. Cheap; if the
       // embed fails we still store it and it can be backfilled later.
@@ -159,9 +179,11 @@ const TOOLS: ToolDef[] = [
       if (!res.ok) {
         return `Unknown model name(s): ${res.unknown.join(', ')}. Call create_model first, or pick existing names from the model index.`;
       }
-      if (res.deduped) return 'Skipped as duplicate of a recent observation.';
+      if (res.deduped) return `Skipped as duplicate of a recent observation.${supersedeIds.length > 0 ? ' Nothing was superseded.' : ''}`;
+      const replaced = memory.markSuperseded(supersedeIds, res.id);
       memory.background(memory.maybeResummarize(res.tagged));
       let out = `Recorded against: ${res.tagged.join(', ')}.`;
+      if (replaced > 0) out += ` Superseded ${replaced} earlier note${replaced > 1 ? 's' : ''}.`;
       // Defrag hint — nudge the agent to declutter when the index fragments.
       const frag = memory.computeFragmentation();
       if (frag.fragmented) {

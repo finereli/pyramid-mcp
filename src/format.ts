@@ -45,6 +45,10 @@ function matchLabel(m: ObservationMatch): string {
     const backing = m.obsCount ? ` · ${m.obsCount} obs` : '';
     return `[${range} · summary tier ${m.tier ?? 0}${backing}]`;
   }
+  if (m.supersededBy) {
+    const by = m.supersededBy.text.length > 160 ? `${m.supersededBy.text.slice(0, 160)}…` : m.supersededBy.text;
+    return `[${isoDate(m.timestamp)} · SUPERSEDED on ${isoDate(m.supersededBy.timestamp)} by: "${by}"]`;
+  }
   return `[${isoDate(m.timestamp)}]`;
 }
 
