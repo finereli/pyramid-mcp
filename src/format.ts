@@ -3,7 +3,7 @@
  * unit-testable in isolation. These shape the text blocks the agent reads, and
  * carry the confidence-tier convention the `instructions` field explains.
  */
-import type { ModelRow, ObservationRow, SummaryRow, ObservationMatch } from './memory-do.js';
+import type { ModelRow, ObservationRow, SummaryRow, ObservationMatch, RecentDays } from './memory-do.js';
 
 const DAY_MS = 86_400_000;
 
@@ -63,7 +63,10 @@ export function formatRecall(matches: ObservationMatch[]): string {
  * character budget so a busy stretch can't blow the context window.
  */
 export function formatRecentNotes(obs: ObservationRow[], capChars = 6000): string {
-  if (obs.length === 0) return '';
+  return recentNoteLines(obs, capChars).join('\n');
+}
+
+function recentNoteLines(obs: ObservationRow[], capChars: number): string[] {
   const lines: string[] = [];
   let used = 0;
   for (const o of obs) {
@@ -72,7 +75,47 @@ export function formatRecentNotes(obs: ObservationRow[], capChars = 6000): strin
     lines.push(line);
     used += line.length + 1;
   }
-  return lines.join('\n');
+  return lines;
+}
+
+/** A note's first sentence, cut to `max` chars — the fallback gist for a day with no digest yet. */
+function firstSentence(text: string, max = 110): string {
+  const m = text.match(/^.*?[.!?](\s|$)/);
+  const s = (m ? m[0] : text).trim();
+  return s.length > max ? `${s.slice(0, max).trimEnd()}…` : s;
+}
+
+/**
+ * load_memory's continuity block: the latest active day verbatim (newest
+ * first, capped by characters, with a count of what the cap held back), then
+ * each earlier active day as one line: its digest, or, until the digest is
+ * written, the first sentences of its newest few notes. One busy day can no
+ * longer push the rest of the week out.
+ */
+export function formatRecentDays(
+  recent: RecentDays,
+  digests: Map<string, { text: string; sourceCount: number }>,
+  capChars = 6000,
+): string {
+  if (!recent.latestDay || recent.latest.length === 0) return '';
+  const parts: string[] = [];
+  const shown = recentNoteLines(recent.latest, capChars);
+  const shownCount = shown.length;
+  const n = recent.latest.length;
+  parts.push(`## ${recent.latestDay} — latest day, verbatim (${n} note${n === 1 ? '' : 's'})\n${shown.join('\n')}`);
+  if (shownCount < n) parts.push(`_+${n - shownCount} earlier note${n - shownCount === 1 ? '' : 's'} from ${recent.latestDay} not shown; recall finds them._`);
+  if (recent.earlier.length > 0) {
+    const lines = recent.earlier.map(({ day, notes }) => {
+      const count = `${notes.length} note${notes.length === 1 ? '' : 's'}`;
+      const d = digests.get(day);
+      if (d && d.sourceCount === notes.length) return `- ${day} (${count}): ${d.text}`;
+      const gist = notes.slice(0, 3).map(o => firstSentence(o.text)).join(' · ');
+      const more = notes.length > 3 ? ` · +${notes.length - 3} more` : '';
+      return `- ${day} (${count}, digest pending): ${gist}${more}`;
+    });
+    parts.push(`## Earlier days — one digest each\n${lines.join('\n')}`);
+  }
+  return parts.join('\n\n');
 }
 
 /**

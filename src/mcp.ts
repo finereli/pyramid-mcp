@@ -9,11 +9,10 @@
  * `env.AI` binding (Workers AI bge-m3) — no per-user key, nothing to forward.
  */
 import { normName, MIN_QUOTE_CHARS, type MemoryDO, type ModelRow } from './memory-do.js';
-import { formatRecall, formatRecentNotes, formatModelView, formatModelIndex } from './format.js';
+import { formatRecall, formatRecentDays, formatModelView, formatModelIndex } from './format.js';
 import { renderWithBudget } from './pyramid.js';
 
 const RECALL_LIMIT = 15;
-const RECENT_NOTES_COUNT = 30;
 const MODEL_VIEW_OBS = 15;
 /** Resolution ramp: newest covered summaries shown per lower tier, and newest observations always shown verbatim. */
 const RAMP_PER_TIER = 2;
@@ -313,8 +312,11 @@ const TOOLS: ToolDef[] = [
     handler: async (memory) => {
       const models = memory.listModels();
       const blocks: string[] = [formatModelIndex(models, memory.modelActivity())];
-      const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT));
-      if (recent) blocks.push(`# Recent notes\n_Newest first — continuity across recent conversations._\n\n${recent}`);
+      const days = memory.recentDays();
+      const recent = formatRecentDays(days, memory.getDayDigests(days.earlier.map(d => d.day)));
+      if (recent) blocks.push(`# Recent notes\n_Continuity across recent conversations: the latest day in full, newest first, then one digest per earlier day. recall has the details behind any digest._\n\n${recent}`);
+      // Digest any earlier day that lacks one (or whose notes changed), for next time.
+      memory.background(memory.ensureDayDigests());
       const core = CORE_MODELS.map(n => models.find(m => m.name === n)).filter((m): m is ModelRow => !!m);
       for (const m of core) blocks.push(renderLoadedModel(memory, m));
       const loaded = core.map(m => `\`${m.name}\``).join(' and ');

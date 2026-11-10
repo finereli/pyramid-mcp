@@ -15,7 +15,7 @@ import { DurableObject } from 'cloudflare:workers';
 import { handleMcpRequest } from './mcp.js';
 import { synthesize } from './synth.js';
 import { embed, embedOne, EMBEDDING_DIM } from './embeddings.js';
-import { batchTier0, batchRollup, buildTier0Job, buildRollupJob, stubSynthesize, type SynthJob } from './pyramid.js';
+import { batchTier0, batchRollup, buildTier0Job, buildRollupJob, buildDayDigestJob, stubSynthesize, type SynthJob } from './pyramid.js';
 
 export interface Env {
   MEMORY_DO: DurableObjectNamespace<MemoryDO>;
@@ -91,6 +91,19 @@ export interface ObservationMatch {
 export interface SummarySource { type: 'observation' | 'summary'; id: string }
 
 export interface AdvanceResult { tier0: number; rollups: number; remaining: boolean }
+
+export interface RecentDays {
+  latestDay: string | null;
+  latest: ObservationRow[];                                   // newest first
+  earlier: Array<{ day: string; notes: ObservationRow[] }>;   // newest day first, notes newest first
+}
+
+/** Earlier active days shown as digests under the latest day, and how far back to look for them. */
+const RECENT_EARLIER_DAYS = 6;
+const RECENT_WINDOW_DAYS = 14;
+
+/** The calendar day (UTC) an observation belongs to, for the recent-days block. */
+export function dayKey(ts: number): string { return new Date(ts).toISOString().slice(0, 10); }
 
 /**
  * Summaries are immutable once written, so a degenerate synthesis result
@@ -177,6 +190,12 @@ export class MemoryDO extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS idx_ss_source ON summary_sources(source_type, source_id);
       CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE IF NOT EXISTS day_digests (
+        day          TEXT PRIMARY KEY,
+        text         TEXT NOT NULL,
+        source_count INTEGER NOT NULL,
+        created_at   INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS supersessions (
         old_id    TEXT PRIMARY KEY,
         new_id    TEXT NOT NULL,
@@ -925,6 +944,83 @@ export class MemoryDO extends DurableObject<Env> {
     return rows.map(toObservationRow);
   }
 
+  // ---------- Recent days (load_memory's continuity block) ----------
+  //
+  // A flat "newest N notes" block let one busy day push the whole week out.
+  // Instead: the latest active day verbatim, and each earlier active day in
+  // the window as one short digest. Digests are a view cache, not the record
+  // (unlike summaries they are regenerated when a day's live notes change);
+  // the observations stay the source of truth. Days are UTC calendar days.
+
+  /** Live notes of the latest active day (newest first), plus earlier active days in the window. */
+  recentDays(maxEarlierDays = RECENT_EARLIER_DAYS, windowDays = RECENT_WINDOW_DAYS): RecentDays {
+    const newest = this.sql.exec(
+      'SELECT MAX(timestamp) AS ts FROM observations WHERE NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)',
+    ).one() as { ts: number | null };
+    if (newest.ts === null) return { latestDay: null, latest: [], earlier: [] };
+    const latestDay = dayKey(newest.ts);
+    const since = Date.parse(`${latestDay}T00:00:00Z`) - windowDays * 86_400_000;
+    const rows = (this.sql.exec(
+      `SELECT id, text, timestamp, source FROM observations
+       WHERE timestamp >= ? AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)
+       ORDER BY timestamp DESC, rowid DESC`,
+      since,
+    ).toArray() as Array<Record<string, unknown>>).map(toObservationRow);
+    const byDay = new Map<string, ObservationRow[]>();
+    for (const o of rows) {
+      const k = dayKey(o.timestamp);
+      if (!byDay.has(k)) byDay.set(k, []);
+      byDay.get(k)!.push(o);
+    }
+    const earlier = [...byDay.entries()]
+      .filter(([d]) => d !== latestDay)
+      .slice(0, maxEarlierDays)
+      .map(([day, notes]) => ({ day, notes }));
+    return { latestDay, latest: byDay.get(latestDay) ?? [], earlier };
+  }
+
+  /** Stored digests for these days. */
+  getDayDigests(days: string[]): Map<string, { text: string; sourceCount: number }> {
+    if (days.length === 0) return new Map();
+    const rows = this.sql.exec(`SELECT day, text, source_count FROM day_digests WHERE day IN (${placeholders(days.length)})`, ...days)
+      .toArray() as Array<{ day: string; text: string; source_count: number }>;
+    return new Map(rows.map(r => [r.day, { text: r.text, sourceCount: r.source_count }]));
+  }
+
+  private digesting: Promise<number> | null = null;
+
+  /**
+   * Write or refresh the digest of each earlier day whose live note count
+   * changed (or that has none), newest day first, at most `maxCalls` LLM calls.
+   * Runs in the background from load_memory; one run at a time. Returns how
+   * many digests were written. A failed synthesis leaves that day on its
+   * fallback gist and is retried next time.
+   */
+  async ensureDayDigests(maxCalls = 2): Promise<number> {
+    if (this.digesting) return this.digesting;
+    const run = (async () => {
+      const { earlier } = this.recentDays();
+      const have = this.getDayDigests(earlier.map(d => d.day));
+      let written = 0;
+      for (const { day, notes } of earlier) {
+        if (written >= maxCalls) break;
+        if (have.get(day)?.sourceCount === notes.length) continue;
+        try {
+          const text = checkSynthOutput(await this.runSynth(buildDayDigestJob(day, notes)));
+          this.sql.exec(
+            `INSERT INTO day_digests (day, text, source_count, created_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(day) DO UPDATE SET text = excluded.text, source_count = excluded.source_count, created_at = excluded.created_at`,
+            day, text, notes.length, Date.now(),
+          );
+          written++;
+        } catch (e) { console.error(`[digest] ${day} failed:`, e); break; }
+      }
+      return written;
+    })();
+    this.digesting = run;
+    try { return await run; } finally { this.digesting = null; }
+  }
+
   // ---------- Confidence / stats ----------
 
   getModelConfidence(modelId: string): { obsCount: number; earliest: number | null; latest: number | null } {
@@ -1112,6 +1208,7 @@ export class MemoryDO extends DurableObject<Env> {
     this.sql.exec('DELETE FROM models');
     this.sql.exec('DELETE FROM config');
     this.sql.exec('DELETE FROM supersessions');
+    this.sql.exec('DELETE FROM day_digests');
     this.ensureSeedModels();
     return { cleared: true };
   }

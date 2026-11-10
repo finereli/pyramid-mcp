@@ -36,6 +36,7 @@ summaries         id, model_id, tier, text, start_timestamp, end_timestamp, sour
 summary_sources   summary_id, source_type ('observation' | 'summary'), source_id
 config            key, value
 supersessions     old_id, new_id, timestamp
+day_digests       day, text, source_count, created_at
 ```
 
 - An **observation** is a short agent-authored note, tagged to one or more models. Observations are never edited or deleted by the system.[^dirty]
@@ -98,7 +99,10 @@ Two prompts (`pyramid.ts`), both lens-aware, both stating the target length, bot
 | `RAMP_PER_TIER` | 2 newest covered summaries per tier below the top | mcp.ts |
 | `RAMP_VERBATIM` | 5 newest observations always verbatim | mcp.ts |
 | minimum accepted summary | 40 chars | memory-do.ts |
-| recent notes cap | 6,000 chars | format.ts |
+| recent notes cap (latest day) | 6,000 chars | format.ts |
+| earlier days shown / window | 6 / 14 days | memory-do.ts |
+| day digest target | 450 chars | pyramid.ts |
+| digests written per `load_memory` | 2 | memory-do.ts |
 | recall limit | 15 | mcp.ts |
 
 ## 6. Reading
@@ -110,7 +114,7 @@ Loading is a deliberate two-step protocol, and the agent **is** the router: it h
 **`load_memory` (no arguments)** returns the map, plus the two **core models** (`CORE_MODELS` in mcp.ts: `user` and `self`) rendered in full, exactly as `load_model` would. Every conversation needs those two, whatever it's about, so leaving them to the agent's pick only costs a round trip, or worse, gets skipped. A Claude Code `SessionStart` hook can force it, but claude.ai and the desktop app have no hooks, so the server does it. Everything else stays a pick:
 
 1. **Model index** - every active model with its description, its note count and the date of its newest note (`[12 obs · last 2026-07-14, 4mo ago]`, or `[no notes yet]`). Descriptions are written once and drift; the date makes a stale one ("active", last note four months ago) visible without loading the model.
-2. **Recent notes** - the newest observations across all models, verbatim, newest first, capped by characters, whether or not a pyramid has covered them. The cross-conversation continuity substitute.[^stream][^recent]
+2. **Recent notes** - the cross-conversation continuity substitute,[^stream][^recent] in two parts. The **latest active day** (UTC) in full: every live (not superseded) observation, newest first, whether or not a pyramid has covered it, capped at 6,000 chars with a count of what the cap held back. Then **up to 6 earlier active days** from the last 14, one line each: a ~450-char **day digest** (Workers AI, one call per day, written in the background by `load_memory`, at most 2 per call), or, until the digest exists, the first sentences of the day's newest three notes. A digest stores the day's live note count and is rewritten when that count changes (a late note, a supersession), so unlike pyramid summaries it is a view cache, not part of the record. The old block (the newest 30 notes, flat) let one busy day push the whole week out: on a 25-note day the agent started the next conversation knowing nothing about the day before.
 
 3. **Core model views** - `user` and `self`.
 

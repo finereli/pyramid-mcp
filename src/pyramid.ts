@@ -101,8 +101,37 @@ The input summaries are preserved separately and stay searchable — you are bui
 
 ${COMMON_RULES}`;
 
+export const DAY_DIGEST_SYSTEM = `You write the digest of one day in a memory system: every note recorded that day, across all topics, compressed into one short paragraph. It sits under the latest day's full notes so the agent reading it keeps a sense of the past week without the week's full text. The notes stay searchable, so you are writing a pointer, not an archive.
+
+Rules:
+- Cover the day's threads in order of weight: what got done or decided, what changed, what is still open. One clause per thread; a quiet day gets one sentence.
+- Keep the specifics that would let someone search for more: names, project names, numbers, decisions, the person's own phrasing.
+- Never invent anything that is not in the notes. Leaving something out is fine; making something up is not.
+- Hold to the target length.
+- Output ONLY the digest prose. No date heading, no preamble, no closing line.`;
+
+/** Soft target for a day digest, in characters. */
+export const DAY_DIGEST_TARGET_CHARS = 450;
+
+/** One UTC day of live notes (any order) → one digest job. */
+export function buildDayDigestJob(day: string, notes: ObservationRow[]): SynthJob {
+  const sorted = [...notes].sort((a, b) => a.timestamp - b.timestamp);
+  const body = sorted.map(o => `- [${new Date(o.timestamp).toISOString().slice(11, 16)} UTC] ${o.text}`).join('\n');
+  const user = `Day: ${day} (${sorted.length} notes)
+
+Notes, oldest first:
+${body}
+
+Write a ~${DAY_DIGEST_TARGET_CHARS}-character digest of this day.`;
+  return {
+    kind: 'digest', tier: 0, system: DAY_DIGEST_SYSTEM, user,
+    maxTokens: Math.ceil((DAY_DIGEST_TARGET_CHARS * 2.5) / 3.5), targetChars: DAY_DIGEST_TARGET_CHARS,
+    startTs: sorted[0]!.timestamp, endTs: sorted[sorted.length - 1]!.timestamp, sourceIds: sorted.map(o => o.id),
+  };
+}
+
 export interface SynthJob {
-  kind: 'tier0' | 'rollup';
+  kind: 'tier0' | 'rollup' | 'digest';
   tier: number;            // depth of the summary being produced
   system: string;
   user: string;
