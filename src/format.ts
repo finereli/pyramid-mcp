@@ -109,10 +109,36 @@ export function formatModelView(
   return parts.join('\n');
 }
 
-/** The model index — every active model, for agent-as-router picks. */
-export function formatModelIndex(models: ModelRow[]): string {
+/** "today", "yesterday", "12d ago", "4mo ago" — how long since a timestamp. */
+export function ago(ts: number, now: number = Date.now()): string {
+  const days = Math.floor((now - ts) / DAY_MS);
+  if (days <= 0) return 'today';
+  if (days === 1) return 'yesterday';
+  if (days < 60) return `${days}d ago`;
+  return `${Math.round(days / 30)}mo ago`;
+}
+
+/**
+ * The model index — every active model, for agent-as-router picks. With
+ * `activity`, each line ends in its note count and newest note date, so a
+ * stale description (says "active", last note four months ago) shows itself.
+ */
+export function formatModelIndex(
+  models: ModelRow[],
+  activity?: Map<string, { obsCount: number; latest: number | null }>,
+  now: number = Date.now(),
+): string {
   if (models.length === 0) return '';
   const sorted = [...models].sort((a, b) => a.name.localeCompare(b.name));
-  const lines = sorted.map(m => `- ${m.name}: ${m.description ?? ''}`.trimEnd());
-  return `# Model index\n_The mental models available. Pass any of these names to load_model to pull its view._\n\n${lines.join('\n')}`;
+  const meta = (m: ModelRow): string => {
+    if (!activity) return '';
+    const a = activity.get(m.id);
+    if (!a || a.obsCount === 0 || a.latest === null) return ' [no notes yet]';
+    return ` [${a.obsCount} obs · last ${isoDate(a.latest)}, ${ago(a.latest, now)}]`;
+  };
+  const lines = sorted.map(m => `- ${m.name}: ${m.description ?? ''}`.trimEnd() + meta(m));
+  const legend = activity
+    ? ' Brackets show how many notes back each model and when the newest was written; an old date means its description may be out of date.'
+    : '';
+  return `# Model index\n_The mental models available. Pass any of these names to load_model to pull its view.${legend}_\n\n${lines.join('\n')}`;
 }

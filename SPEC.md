@@ -107,7 +107,7 @@ Loading is a deliberate two-step protocol, and the agent **is** the router: it h
 
 **`load_memory` (no arguments)** returns the map, never the memories:
 
-1. **Model index** - every active model with its description.
+1. **Model index** - every active model with its description, its note count and the date of its newest note (`[12 obs · last 2026-07-14, 4mo ago]`, or `[no notes yet]`). Descriptions are written once and drift; the date makes a stale one ("active", last note four months ago) visible without loading the model.
 2. **Recent notes** - the newest observations across all models, verbatim, newest first, capped by characters, whether or not a pyramid has covered them. The cross-conversation continuity substitute.[^stream][^recent]
 
 The response ends by saying so in-band: nothing is loaded yet - pick the relevant models and call `load_model`. That visible incompleteness is the mechanism: an index alone is a menu, and a menu demands a pick.

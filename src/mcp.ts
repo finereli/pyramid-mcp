@@ -266,7 +266,7 @@ const TOOLS: ToolDef[] = [
       'The entry point to memory — call at the start of every conversation, before anything else. Returns the model index (every mental model with its description) and recent notes (continuity across conversations). It loads no memories by itself: read the index, pick every model relevant to the conversation, and call load_model once per model (in parallel is fine). Loading memory always takes both steps.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (memory) => {
-      const blocks: string[] = [formatModelIndex(memory.listModels())];
+      const blocks: string[] = [formatModelIndex(memory.listModels(), memory.modelActivity())];
       const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT));
       if (recent) blocks.push(`# Recent notes\n_Newest first — continuity across recent conversations._\n\n${recent}`);
       blocks.push('_This is the map, not the memory — nothing is loaded yet. Pick every model relevant to this conversation and call `load_model` for each one (parallel calls are fine)._');

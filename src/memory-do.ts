@@ -301,6 +301,20 @@ export class MemoryDO extends DurableObject<Env> {
     return rows.map(toModelRow);
   }
 
+  /**
+   * Note count and newest note per model, in one grouped query — what the
+   * model index shows next to each description, so a description that has
+   * gone stale ("active", but nothing recorded in months) is visible at a glance.
+   */
+  modelActivity(): Map<string, { obsCount: number; latest: number | null }> {
+    const rows = this.sql.exec(
+      `SELECT t.model_id AS id, COUNT(*) AS c, MAX(o.timestamp) AS latest
+       FROM observation_tags t JOIN observations o ON o.id = t.observation_id
+       GROUP BY t.model_id`,
+    ).toArray() as Array<{ id: string; c: number; latest: number | null }>;
+    return new Map(rows.map(r => [r.id, { obsCount: r.c, latest: r.latest }]));
+  }
+
   getModel(name: string): ModelRow | undefined {
     const row = this.sql
       .exec('SELECT id, name, description, is_seed, archived, created_at FROM models WHERE name = ?', name)
