@@ -136,8 +136,8 @@ A bottom-up pyramid cannot know at tier-0 time which detail will matter later. H
 
 ## 7. Tool surface (MCP)
 
-- `record_observation(text, models[], supersedes?[])` - multi-tag, agent-authored, prefix-dedup within 24h; `supersedes` quotes earlier notes this one corrects (§4). Rejects unknown model names. Triggers background pyramid growth; returns a **defrag hint** when the model index fragments (too many sparse models).
-- `create_model(name, description)` - upsert by name. `update_model_description`, `rename_model`, `archive_model` - maintenance; seeds protected. `fold(source, into, synthesis)` - record a synthesis observation into the target, archive the source.
+- `record_observation(text, models[], supersedes?[])` - multi-tag, agent-authored, prefix-dedup within 24h; `supersedes` quotes earlier notes this one corrects (§4). Rejects unknown model names. Triggers background pyramid growth; returns a **defrag hint** when the model index fragments (too many sparse models), naming up to 8 of them and pointing at `suggest_folds`.
+- `create_model(name, description)` - upsert by name. `update_model_description`, `rename_model`, `archive_model` - maintenance; seeds protected. `fold(source, into, synthesis, carry_observations?)` - tag the source's observations to the target too (default; they join its pyramid as a fresh tail, so folded detail stays in a model that gets loaded instead of on an archived one nothing loads), record a synthesis observation into the target, archive the source. `suggest_folds()` - read-only: each sparse model (non-seed, under 5 notes) with its two closest active models by content, the cosine similarity of mean observation embeddings ("kali" and "hobbies" share no name token but are plainly one lens). The agent decides; this only ranks. A parent model is the agent's move: `create_model` it, then fold each sparse sibling in.
 - `recall(query)` - §6.2.
 - `load_memory()` - §6.1; the map: model index + recent notes, no arguments.
 - `load_model(name)` - §6.1; one model's view; also triggers background growth for the loaded model.

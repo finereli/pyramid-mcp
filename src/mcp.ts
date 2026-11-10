@@ -186,7 +186,9 @@ const TOOLS: ToolDef[] = [
       // Defrag hint — nudge the agent to declutter when the index fragments.
       const frag = memory.computeFragmentation();
       if (frag.fragmented) {
-        out += `\n\n[memory note: ${frag.underPopulated} sparse models out of ${frag.activeModels} active — consider folding related ones (fold) or archiving stale ones (archive_model).]`;
+        const names = frag.sparse.length === 0 ? ''
+          : ` (${frag.sparse.slice(0, 8).join(', ')}${frag.sparse.length > 8 ? `, +${frag.sparse.length - 8} more` : ''})`;
+        out += `\n\n[memory note: ${frag.underPopulated} sparse models out of ${frag.activeModels} active${names}. Call suggest_folds to see what each is closest to, then fold related ones or archive stale ones (archive_model).]`;
       }
       return out;
     },
@@ -265,13 +267,14 @@ const TOOLS: ToolDef[] = [
   {
     name: 'fold',
     description:
-      'Fold one model into another: write a synthesis observation (your own summary of what the source held) into the target model, then archive the source. Use to consolidate redundant or sub-scale models. The synthesis is timestamped now and lands in the target\'s recent tier — consolidation is itself a meaningful event. Source seed models are protected.',
+      'Fold one model into another: the source\'s notes join the target model, a synthesis observation (your own summary of what the source held) is recorded into the target, and the source is archived. Use to consolidate redundant or sub-scale models (suggest_folds finds candidates); to group several under a new parent, create_model the parent first and fold each into it. The synthesis is timestamped now and lands in the target\'s recent tier — consolidation is itself a meaningful event. Source seed models are protected.',
     inputSchema: {
       type: 'object',
       properties: {
         source: { type: 'string', description: 'Model to fold away (will be archived).' },
         into: { type: 'string', description: 'Target model that absorbs it.' },
         synthesis: { type: 'string', description: 'Your synthesis of what the source model held — written in your own voice, to be recorded as an observation in the target.' },
+        carry_observations: { type: 'boolean', description: 'Tag the source\'s notes to the target too, so they join its history (default true). Pass false to keep only the synthesis.' },
       },
       required: ['source', 'into', 'synthesis'],
     },
@@ -280,8 +283,34 @@ const TOOLS: ToolDef[] = [
       if (!synthesis) return 'Provide a synthesis of what the source model held.';
       let embedding: number[] | undefined;
       try { embedding = await memory.embed(synthesis); } catch { /* store without vector */ }
-      const r = memory.foldModel(String(args.source ?? '').trim(), String(args.into ?? '').trim(), synthesis, embedding);
-      return r.ok ? `Folded "${args.source}" into "${args.into}" and archived the source.` : r.reason!;
+      const into = String(args.into ?? '').trim();
+      const r = memory.foldModel(String(args.source ?? '').trim(), into, synthesis, embedding, args.carry_observations !== false);
+      if (!r.ok) return r.reason!;
+      // The carried notes are a fresh tail for the target: let its pyramid catch up.
+      if (r.carried) memory.background(memory.maybeResummarize([into]));
+      const carried = r.carried ? ` ${r.carried} note${r.carried === 1 ? '' : 's'} came along.` : '';
+      return `Folded "${args.source}" into "${into}" and archived the source.${carried}`;
+    },
+  },
+  {
+    name: 'suggest_folds',
+    description:
+      'List fold candidates: each sparse model (fewer than 5 notes, seeds excluded) with the models closest to it by content (similarity of what their notes say, not their names). Read-only. Use when the memory note says the index is fragmenting, or when tidying up; then fold, or create a parent model and fold several into it.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async (memory) => {
+      const rows = memory.suggestFolds();
+      if (rows.length === 0) return 'No sparse models; nothing to fold.';
+      const lines = rows.map(r => {
+        const meta = r.obsCount === 0 || r.latest === null ? 'no notes' : `${r.obsCount} obs, last ${day(r.latest)}`;
+        if (r.closest.length === 0) return `- ${r.name} (${meta}) → nothing to compare; archive_model it if it's dead, keep it if it's new.`;
+        return `- ${r.name} (${meta}) → ${r.closest.map(c => `${c.name} ${c.similarity.toFixed(2)}`).join(' · ')}`;
+      });
+      return [
+        'Sparse models, strongest match first. Each arrow lists the closest models by content (cosine similarity, 1.00 = identical).',
+        ...lines,
+        '',
+        'Fold a sparse model into a close match (its notes come along). When several sparse models share a theme but no existing model fits, create_model a parent and fold each into it. Similarity is a hint, not a verdict: fold only what genuinely belongs together.',
+      ].join('\n');
     },
   },
   {

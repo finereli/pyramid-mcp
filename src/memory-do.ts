@@ -117,6 +117,9 @@ export function checkSynthOutput(text: string): string {
   return t;
 }
 
+/** A non-seed model with fewer notes than this is sparse: a fold candidate. */
+const SPARSE_FLOOR = 5;
+
 /** Minimum quote length for finding a note to supersede; shorter quotes match too much. */
 export const MIN_QUOTE_CHARS = 12;
 /** Recall ranks a superseded note below its live neighbours by this much (scores are 0..~1, lower = better). */
@@ -1059,35 +1062,84 @@ export class MemoryDO extends DurableObject<Env> {
    * summarizing the source) tagged to the target, then archive the source. Source
    * seeds are protected. Reinforcement is intentional — the synthesis lands in the
    * target's recent tier.
+   *
+   * With `carryObservations` (the default) the source's observations are also
+   * tagged to the target, so they join its pyramid (as a fresh tail, batched
+   * by timestamp) instead of staying behind on an archived model that nothing
+   * loads. Nothing is copied or rewritten; it's one tag row per observation.
    */
-  foldModel(source: string, into: string, synthesis: string, embedding?: number[]): { ok: boolean; reason?: string } {
+  foldModel(source: string, into: string, synthesis: string, embedding?: number[], carryObservations = true): { ok: boolean; reason?: string; carried?: number } {
     if (isProtectedSeed(source)) return { ok: false, reason: `"${source}" is a protected seed model and can't be folded away.` };
     const s = this.getModel(source);
     const t = this.getModel(into);
     if (!s) return { ok: false, reason: `No model named "${source}".` };
     if (!t) return { ok: false, reason: `No model named "${into}".` };
+    if (s.id === t.id) return { ok: false, reason: 'A model cannot be folded into itself.' };
+    const carried = carryObservations
+      ? this.sql.exec('INSERT OR IGNORE INTO observation_tags (observation_id, model_id) SELECT observation_id, ? FROM observation_tags WHERE model_id = ?', t.id, s.id).rowsWritten
+      : 0;
     const id = crypto.randomUUID();
     const blob = embedding ? floatsToBlob(normalizeVec(embedding)) : null;
     this.sql.exec('INSERT INTO observations (id, text, timestamp, source, embedding) VALUES (?, ?, ?, ?, ?)', id, synthesis, Date.now(), 'fold', blob);
     this.sql.exec('INSERT OR IGNORE INTO observation_tags (observation_id, model_id) VALUES (?, ?)', id, t.id);
     this.sql.exec('UPDATE models SET archived = 1 WHERE id = ?', s.id);
-    return { ok: true };
+    return { ok: true, carried };
   }
 
   /**
    * Fragmentation signal for the defrag hint. Counts active models and how many
-   * (non-seed) are under-populated. (Centroid-similarity dedup is a later
-   * refinement; this cheap version drives the in-conversation nudge.)
+   * (non-seed) are under-populated, and names them so the hint can too.
    */
-  computeFragmentation(): { activeModels: number; underPopulated: number; fragmented: boolean } {
-    const FLOOR = 5;
+  computeFragmentation(): { activeModels: number; underPopulated: number; fragmented: boolean; sparse: string[] } {
     const models = this.listModels();
-    let under = 0;
-    for (const m of models) {
-      if (isProtectedSeed(m.name)) continue;
-      if (this.getModelConfidence(m.id).obsCount < FLOOR) under++;
+    const activity = this.modelActivity();
+    const sparse = models
+      .filter(m => !isProtectedSeed(m.name) && (activity.get(m.id)?.obsCount ?? 0) < SPARSE_FLOOR)
+      .map(m => m.name);
+    return { activeModels: models.length, underPopulated: sparse.length, fragmented: sparse.length >= 6 || models.length > 40, sparse };
+  }
+
+  /**
+   * Fold candidates: every sparse (non-seed, under SPARSE_FLOOR notes) active
+   * model with its closest active models by content — cosine similarity of
+   * the mean of each model's observation embeddings. Content, not names:
+   * "kali" and "hobbies" share no token but are plainly the same lens. The
+   * agent decides; this only ranks. Strongest match first.
+   */
+  suggestFolds(perModel = 2): Array<{ name: string; obsCount: number; latest: number | null; closest: Array<{ name: string; similarity: number }> }> {
+    const models = this.listModels();
+    const activity = this.modelActivity();
+    const nameById = new Map(models.map(m => [m.id, m.name]));
+    // Centroids: sum each model's unit vectors, then normalize.
+    const sums = new Map<string, Float64Array>();
+    const rows = this.sql.exec(
+      `SELECT t.model_id AS id, o.embedding FROM observation_tags t JOIN observations o ON o.id = t.observation_id
+       JOIN models m ON m.id = t.model_id
+       WHERE m.archived = 0 AND o.embedding IS NOT NULL`,
+    ).toArray() as Array<{ id: string; embedding: ArrayBuffer }>;
+    for (const r of rows) {
+      const v = blobToFloats(r.embedding);
+      let acc = sums.get(r.id);
+      if (!acc) { acc = new Float64Array(v.length); sums.set(r.id, acc); }
+      for (let i = 0; i < v.length && i < acc.length; i++) acc[i] = acc[i]! + v[i]!;
     }
-    return { activeModels: models.length, underPopulated: under, fragmented: under >= 6 || models.length > 40 };
+    const centroids = new Map<string, Float32Array>();
+    for (const [id, acc] of sums) centroids.set(id, new Float32Array(normalizeVec(Array.from(acc))));
+
+    const out = models
+      .filter(m => !isProtectedSeed(m.name) && (activity.get(m.id)?.obsCount ?? 0) < SPARSE_FLOOR)
+      .map(m => {
+        const cv = centroids.get(m.id);
+        const c = cv ? Array.from(cv) : null;
+        const closest = !c ? [] : [...centroids.entries()]
+          .filter(([id]) => id !== m.id && nameById.has(id))
+          .map(([id, v]) => ({ name: nameById.get(id)!, similarity: dot(c, v) }))
+          .sort((a, b) => b.similarity - a.similarity)
+          .slice(0, perModel);
+        const a = activity.get(m.id);
+        return { name: m.name, obsCount: a?.obsCount ?? 0, latest: a?.latest ?? null, closest };
+      });
+    return out.sort((a, b) => (b.closest[0]?.similarity ?? -1) - (a.closest[0]?.similarity ?? -1));
   }
 
   getStats(): { models: number; observations: number; summaries: number; embedded: number; summariesEmbedded: number; embeddingDim: number; observationSize: SizeStats; summarySize: SizeStats; perModel: ModelStats[] } {

@@ -44,6 +44,54 @@ describe('maintenance ops', () => {
     expect((await u.foldModel('self', 'user', 'x')).ok).toBe(false); // seed source protected
   });
 
+  it('fold carries the source\'s notes into the target by default, and can leave them behind', async () => {
+    const u = freshUser();
+    await u.createModel('kali', 'martial art');
+    await u.createModel('hobbies', 'hobbies');
+    await u.addObservation('Kali training twice a week with sticks', ['kali']);
+    await u.addObservation('Kali drill: heaven six, sinawali pattern', ['kali', 'hobbies']); // already on both
+    const r = await u.foldModel('kali', 'hobbies', 'Kali folded into hobbies: stick training, drills.');
+    expect(r.ok).toBe(true);
+    expect(r.carried).toBe(1); // the doubly-tagged note was already there
+    const hobbies = await u.getModel('hobbies');
+    const texts = (await u.listObservationsForModel(hobbies!.id)).map(o => o.text);
+    expect(texts).toContain('Kali training twice a week with sticks');
+    expect(texts).toContain('Kali folded into hobbies: stick training, drills.');
+
+    await u.createModel('chess', 'chess');
+    await u.addObservation('Learned the London system opening', ['chess']);
+    const keep = await u.foldModel('chess', 'hobbies', 'Chess folded in.', undefined, false);
+    expect(keep.carried).toBe(0);
+    expect((await u.listObservationsForModel(hobbies!.id)).map(o => o.text)).not.toContain('Learned the London system opening');
+
+    await u.createModel('solo', 'x');
+    expect((await u.foldModel('solo', 'solo', 'x')).ok).toBe(false); // not into itself
+  });
+
+  it('suggest_folds ranks each sparse model\'s closest models by content', async () => {
+    const u = freshUser();
+    for (const [name, desc] of [['dnd-maps', 'map app'], ['dnd-campaign', 'campaign'], ['geometry', 'math'], ['empty', 'nothing yet']]) await u.createModel(name, desc);
+    const dnd = [1, 0.1, 0, 0], dnd2 = [0.9, 0.2, 0, 0], math = [0, 0, 1, 0.1];
+    await u.bulkLoad([], [
+      { text: 'tokens on the tactical map', timestamp: Date.now() - 3000, models: ['dnd-maps'], embedding: dnd },
+      { text: 'the party met the bandit captain', timestamp: Date.now() - 2000, models: ['dnd-campaign'], embedding: dnd2 },
+      { text: 'angle relationships in proofs', timestamp: Date.now() - 1000, models: ['geometry'], embedding: math },
+    ]);
+    const rows = await u.suggestFolds();
+    const maps = rows.find(r => r.name === 'dnd-maps')!;
+    expect(maps.obsCount).toBe(1);
+    expect(maps.closest[0]!.name).toBe('dnd-campaign');
+    expect(maps.closest[0]!.similarity).toBeGreaterThan(0.9);
+    const geo = rows.find(r => r.name === 'geometry')!;
+    expect(geo.closest[0]!.similarity).toBeLessThan(0.2);
+    expect(rows.find(r => r.name === 'empty')!.closest).toEqual([]);
+    expect(rows.some(r => r.name === 'user')).toBe(false); // seeds are never fold candidates
+    expect(rows[0]!.name.startsWith('dnd-')).toBe(true);   // strongest match first
+
+    const frag = await u.computeFragmentation();
+    expect(frag.sparse).toEqual(expect.arrayContaining(['dnd-maps', 'dnd-campaign', 'geometry', 'empty']));
+  });
+
   it('flags fragmentation when many sparse models accumulate', async () => {
     const u = freshUser();
     let frag = await u.computeFragmentation();
