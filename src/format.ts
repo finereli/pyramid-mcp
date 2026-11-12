@@ -3,7 +3,7 @@
  * unit-testable in isolation. These shape the text blocks the agent reads, and
  * carry the confidence-tier convention the `instructions` field explains.
  */
-import type { ModelRow, ObservationRow, SummaryRow, ObservationMatch, RecentDays } from './memory-do.js';
+import type { ModelRow, ObservationRow, SummaryRow, ObservationMatch, RecentDays, PinRow, LoopRow } from './memory-do.js';
 
 const DAY_MS = 86_400_000;
 
@@ -49,7 +49,23 @@ function matchLabel(m: ObservationMatch): string {
     const by = m.supersededBy.text.length > 160 ? `${m.supersededBy.text.slice(0, 160)}…` : m.supersededBy.text;
     return `[${isoDate(m.timestamp)} · SUPERSEDED on ${isoDate(m.supersededBy.timestamp)} by: "${by}"]`;
   }
-  return `[${isoDate(m.timestamp)}]`;
+  return `[${isoDate(m.timestamp)}${m.quiet ? ' · quiet' : ''}]`;
+}
+
+/** Standing agreements, verbatim, each with the id pin/unpin take. */
+export function formatPins(pins: PinRow[]): string {
+  if (pins.length === 0) return '';
+  return `# Pinned\n_Standing agreements, kept word for word and always current. They outrank anything older that seems to say otherwise._\n\n${pins.map(p => `- [p${p.id}] ${p.text}`).join('\n')}`;
+}
+
+/** Unfinished work, oldest first, plus what closed in the last two days. */
+export function formatLoops(open: LoopRow[], recentlyClosed: LoopRow[]): string {
+  if (open.length === 0 && recentlyClosed.length === 0) return '';
+  const lines = open.map(l => `- [l${l.id} · since ${isoDate(l.openedAt)}] ${l.text}`);
+  const closed = recentlyClosed.map(l => `- [l${l.id} · closed ${isoDate(l.closedAt!)}] ${l.text}${l.outcome ? ` → ${l.outcome}` : ''}`);
+  const parts = [`# Open loops\n_Unfinished work. close_loop when one is done._\n\n${lines.length > 0 ? lines.join('\n') : '_None open._'}`];
+  if (closed.length > 0) parts.push(`Recently closed:\n${closed.join('\n')}`);
+  return parts.join('\n\n');
 }
 
 /** Raw recall results — numbered, dated, best first. Observations are receipts, summaries are arcs. Agent synthesizes. */
@@ -177,6 +193,16 @@ export function ago(ts: number, now: number = Date.now()): string {
   return `${Math.round(days / 30)}mo ago`;
 }
 
+/** Index lines carry a description cut to this length: enough to route, not the whole lens. */
+export const INDEX_DESC_CHARS = 140;
+
+function clip(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const sp = cut.lastIndexOf(' ');
+  return `${(sp > max * 0.6 ? cut.slice(0, sp) : cut).trimEnd()}…`;
+}
+
 /**
  * The model index — every active model, for agent-as-router picks. With
  * `activity`, each line ends in its note count and newest note date, so a
@@ -195,7 +221,7 @@ export function formatModelIndex(
     if (!a || a.obsCount === 0 || a.latest === null) return ' [no notes yet]';
     return ` [${a.obsCount} obs · last ${isoDate(a.latest)}, ${ago(a.latest, now)}]`;
   };
-  const lines = sorted.map(m => `- ${m.name}: ${m.description ?? ''}`.trimEnd() + meta(m));
+  const lines = sorted.map(m => `- ${m.name}: ${clip(m.description ?? '', INDEX_DESC_CHARS)}`.trimEnd() + meta(m));
   const legend = activity
     ? ' Brackets show how many notes back each model and when the newest was written; an old date means its description may be out of date.'
     : '';

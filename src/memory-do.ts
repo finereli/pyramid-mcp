@@ -55,6 +55,8 @@ export interface ObservationRow {
   source: string;
   /** Set on view rows only: this observation is already inside a tier-0 summary shown above (resolution ramp). */
   covered?: boolean;
+  /** Recall rows only: a quiet note (kept out of loaded views; recall still finds it). */
+  quiet?: boolean;
   /** Set on read-path rows only: the earlier notes this one superseded, oldest first, so a correction carries its history. */
   corrects?: Array<{ timestamp: number; text: string }>;
 }
@@ -88,7 +90,11 @@ export interface ObservationMatch {
   startTimestamp?: number; // summaries only
   obsCount?: number;     // summaries only: raw observations behind it, through all tiers
   supersededBy?: { timestamp: number; text: string }; // observations only: a later note corrected this one
+  quiet?: boolean;       // observations only: kept out of loaded views
 }
+
+export interface PinRow { id: number; text: string; createdAt: number; updatedAt: number }
+export interface LoopRow { id: number; text: string; openedAt: number; closedAt: number | null; outcome: string | null }
 
 export interface SummarySource { type: 'observation' | 'summary'; id: string }
 
@@ -206,6 +212,22 @@ export class MemoryDO extends DurableObject<Env> {
         new_id    TEXT NOT NULL,
         timestamp INTEGER NOT NULL
       );
+      -- Standing agreements: never summarized, never aged out, always loaded.
+      CREATE TABLE IF NOT EXISTS pins (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        text       TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        removed_at INTEGER
+      );
+      -- Unfinished work, open until explicitly closed.
+      CREATE TABLE IF NOT EXISTS loops (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        text      TEXT NOT NULL,
+        opened_at INTEGER NOT NULL,
+        closed_at INTEGER,
+        outcome   TEXT
+      );
     `);
     // Add columns introduced after the initial schema, for DOs created earlier.
     try { this.sql.exec('ALTER TABLE models ADD COLUMN last_summarized_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already present */ }
@@ -214,6 +236,8 @@ export class MemoryDO extends DurableObject<Env> {
     // summary through all tiers. NULL marks pre-migration rows for backfill.
     try { this.sql.exec('ALTER TABLE summaries ADD COLUMN obs_count INTEGER'); } catch { /* already present */ }
     try { this.sql.exec('ALTER TABLE summaries ADD COLUMN source_chars INTEGER'); } catch { /* already present */ }
+    // Quiet notes: findable by recall, kept out of everything loaded by default.
+    try { this.sql.exec('ALTER TABLE observations ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0'); } catch { /* already present */ }
     // Migration from the time-window pyramid (pre Aug 2026): a summary without
     // provenance rows is invalid in this design — nothing can be covered by it
     // and nothing can roll it up. Drop any such rows; the pyramid regrows
@@ -394,6 +418,7 @@ export class MemoryDO extends DurableObject<Env> {
     modelNames: string[],
     source = 'direct',
     embedding?: number[],
+    quiet = false,
   ): AddObservationResult {
     if (modelNames.length === 0) return { ok: false, unknown: [] };
 
@@ -412,8 +437,8 @@ export class MemoryDO extends DurableObject<Env> {
     const timestamp = Date.now();
     const blob = embedding ? floatsToBlob(normalizeVec(embedding)) : null;
     this.sql.exec(
-      'INSERT INTO observations (id, text, timestamp, source, embedding) VALUES (?, ?, ?, ?, ?)',
-      id, text, timestamp, source, blob,
+      'INSERT INTO observations (id, text, timestamp, source, embedding, quiet) VALUES (?, ?, ?, ?, ?, ?)',
+      id, text, timestamp, source, blob, quiet ? 1 : 0,
     );
     for (const name of modelNames) {
       this.sql.exec(
@@ -490,6 +515,70 @@ export class MemoryDO extends DurableObject<Env> {
     return new Set(rows.map(r => r.old_id));
   }
 
+  // ---------- Quiet notes ----------
+
+  /**
+   * Make notes quiet: kept out of recent notes, model views and future
+   * summaries; recall still finds them. Returns, per id, whether a summary
+   * already holds it (a summary is immutable, so that copy stays).
+   */
+  markQuiet(ids: string[]): Array<{ id: string; alreadySummarized: boolean }> {
+    return ids.map(id => {
+      this.sql.exec('UPDATE observations SET quiet = 1 WHERE id = ?', id);
+      const held = this.sql.exec(
+        "SELECT COUNT(*) AS n FROM summary_sources WHERE source_type = 'observation' AND source_id = ?", id,
+      ).one() as { n: number };
+      return { id, alreadySummarized: held.n > 0 };
+    });
+  }
+
+  // ---------- Pins (standing agreements) ----------
+
+  listPins(): PinRow[] {
+    return (this.sql.exec('SELECT id, text, created_at, updated_at FROM pins WHERE removed_at IS NULL ORDER BY id ASC')
+      .toArray() as Array<{ id: number; text: string; created_at: number; updated_at: number }>)
+      .map(r => ({ id: r.id, text: r.text, createdAt: r.created_at, updatedAt: r.updated_at }));
+  }
+
+  addPin(text: string): number {
+    const now = Date.now();
+    const row = this.sql.exec('INSERT INTO pins (text, created_at, updated_at) VALUES (?, ?, ?) RETURNING id', text, now, now).one() as { id: number };
+    return row.id;
+  }
+
+  /** Reword a live pin in place. False if there is no live pin with that id. */
+  editPin(id: number, text: string): boolean {
+    return this.sql.exec('UPDATE pins SET text = ?, updated_at = ? WHERE id = ? AND removed_at IS NULL RETURNING id', text, Date.now(), id).toArray().length > 0;
+  }
+
+  /** Retire a pin (kept in the table, no longer loaded). False if there is no live pin with that id. */
+  removePin(id: number): boolean {
+    return this.sql.exec('UPDATE pins SET removed_at = ? WHERE id = ? AND removed_at IS NULL RETURNING id', Date.now(), id).toArray().length > 0;
+  }
+
+  // ---------- Open loops ----------
+
+  /** Open loops oldest first, then loops closed within `closedWithinMs` (newest first) for continuity. */
+  listLoops(closedWithinMs = 2 * 86_400_000): { open: LoopRow[]; recentlyClosed: LoopRow[] } {
+    const map = (rows: unknown[]) => (rows as Array<{ id: number; text: string; opened_at: number; closed_at: number | null; outcome: string | null }>)
+      .map(r => ({ id: r.id, text: r.text, openedAt: r.opened_at, closedAt: r.closed_at, outcome: r.outcome }));
+    return {
+      open: map(this.sql.exec('SELECT id, text, opened_at, closed_at, outcome FROM loops WHERE closed_at IS NULL ORDER BY id ASC').toArray()),
+      recentlyClosed: map(this.sql.exec('SELECT id, text, opened_at, closed_at, outcome FROM loops WHERE closed_at >= ? ORDER BY closed_at DESC', Date.now() - closedWithinMs).toArray()),
+    };
+  }
+
+  openLoop(text: string): number {
+    const row = this.sql.exec('INSERT INTO loops (text, opened_at) VALUES (?, ?) RETURNING id', text, Date.now()).one() as { id: number };
+    return row.id;
+  }
+
+  /** Close an open loop. Returns its text, or null if there is no open loop with that id. */
+  closeLoop(id: number, outcome?: string): string | null {
+    const rows = this.sql.exec('UPDATE loops SET closed_at = ?, outcome = ? WHERE id = ? AND closed_at IS NULL RETURNING text', Date.now(), outcome ?? null, id).toArray() as Array<{ text: string }>;
+    return rows[0]?.text ?? null;
+  }
+
   /**
    * Read path: attach to each row the notes it superseded (oldest first), so
    * a correction shows what it replaced instead of the old note silently
@@ -559,11 +648,12 @@ export class MemoryDO extends DurableObject<Env> {
       return (1 - sim) * (1 - timeWeight) + computeTimePenalty(ts, now) * timeWeight;
     };
     const obs = this.sql
-      .exec('SELECT id, text, timestamp, embedding FROM observations WHERE embedding IS NOT NULL')
-      .toArray() as Array<{ id: string; text: string; timestamp: number; embedding: ArrayBuffer }>;
+      .exec('SELECT id, text, timestamp, quiet, embedding FROM observations WHERE embedding IS NOT NULL')
+      .toArray() as Array<{ id: string; text: string; timestamp: number; quiet: number; embedding: ArrayBuffer }>;
     const superseded = new Set((this.sql.exec('SELECT old_id FROM supersessions').toArray() as Array<{ old_id: string }>).map(r => r.old_id));
     const scored: ObservationMatch[] = obs.map(r => ({
       id: r.id, text: r.text, timestamp: r.timestamp, kind: 'observation' as const,
+      ...(r.quiet ? { quiet: true } : {}),
       // Corrections outrank what they corrected; the old note stays findable.
       score: score(r.embedding, r.timestamp) + (superseded.has(r.id) ? SUPERSEDED_PENALTY : 0),
     }));
@@ -661,6 +751,7 @@ export class MemoryDO extends DurableObject<Env> {
        FROM observations o
        JOIN observation_tags t ON t.observation_id = o.id
        WHERE t.model_id = ?
+         AND o.quiet = 0 -- quiet notes are never summarized or shown; recall finds them
          AND NOT EXISTS (
            SELECT 1 FROM summary_sources ss JOIN summaries s ON s.id = ss.summary_id
            WHERE ss.source_type = 'observation' AND ss.source_id = o.id AND s.model_id = ?
@@ -733,6 +824,7 @@ export class MemoryDO extends DurableObject<Env> {
            AND EXISTS (SELECT 1 FROM summary_sources ss JOIN summaries s ON s.id = ss.summary_id
                        WHERE ss.source_type = 'observation' AND ss.source_id = o.id AND s.model_id = ?)
            AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = o.id)
+           AND o.quiet = 0
          ORDER BY o.timestamp DESC, o.rowid DESC LIMIT ?`,
         modelId, modelId, need,
       ).toArray() as Array<Record<string, unknown>>;
@@ -984,14 +1076,14 @@ export class MemoryDO extends DurableObject<Env> {
   /** Live notes of the latest active day (newest first), plus earlier active days in the window. */
   recentDays(maxEarlierDays = RECENT_EARLIER_DAYS, windowDays = RECENT_WINDOW_DAYS): RecentDays {
     const newest = this.sql.exec(
-      'SELECT MAX(timestamp) AS ts FROM observations WHERE NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)',
+      'SELECT MAX(timestamp) AS ts FROM observations WHERE quiet = 0 AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)',
     ).one() as { ts: number | null };
     if (newest.ts === null) return { latestDay: null, latest: [], earlier: [] };
     const latestDay = dayKey(newest.ts);
     const since = Date.parse(`${latestDay}T00:00:00Z`) - windowDays * 86_400_000;
     const rows = (this.sql.exec(
       `SELECT id, text, timestamp, source FROM observations
-       WHERE timestamp >= ? AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)
+       WHERE timestamp >= ? AND quiet = 0 AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)
        ORDER BY timestamp DESC, rowid DESC`,
       since,
     ).toArray() as Array<Record<string, unknown>>).map(toObservationRow);

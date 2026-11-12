@@ -126,8 +126,9 @@ describe('MCP transport over /mcp', () => {
     expect(text).toContain('## user — ');
     expect(text).toContain('## self — ');
     expect(text).not.toContain('## coaching — ');
-    expect(text.split('# Loaded model').length - 1).toBe(2);
-    expect(text).toContain('Only `user` and `self` are loaded');
+    expect(text.split('# Core model (compact)').length - 1).toBe(2);
+    expect(text).not.toContain('# Loaded model');
+    expect(text).toContain('Only compact views of `user` and `self` are loaded');
     expect(text).toContain('load_model');
   });
 

@@ -101,7 +101,7 @@ describe('supersession — record_observation', () => {
     expect(out).toContain('Recorded against: user.');
     expect(out).toContain('Superseded 1 earlier note.');
     const lm = await call(u, 'load_memory', {});
-    const recent = lm.slice(lm.indexOf('# Recent notes'), lm.indexOf('# Loaded model'));
+    const recent = lm.slice(lm.indexOf('# Recent notes'), lm.indexOf('# Core model'));
     expect(recent).toContain('left at the default');
     // The old note is gone as a line of its own; it survives only as the correction's stub.
     expect(recent).not.toMatch(/^- \[[^\]]*\] Tom wants split_width_multiplier/m);
