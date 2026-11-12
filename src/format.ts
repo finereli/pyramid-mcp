@@ -3,7 +3,7 @@
  * unit-testable in isolation. These shape the text blocks the agent reads, and
  * carry the confidence-tier convention the `instructions` field explains.
  */
-import type { ModelRow, ObservationRow, SummaryRow, ObservationMatch } from './memory-do.js';
+import type { ModelRow, ObservationRow, SummaryRow, ObservationMatch, RecentDays, PinRow, LoopRow } from './memory-do.js';
 
 const DAY_MS = 86_400_000;
 
@@ -45,7 +45,27 @@ function matchLabel(m: ObservationMatch): string {
     const backing = m.obsCount ? ` · ${m.obsCount} obs` : '';
     return `[${range} · summary tier ${m.tier ?? 0}${backing}]`;
   }
-  return `[${isoDate(m.timestamp)}]`;
+  if (m.supersededBy) {
+    const by = m.supersededBy.text.length > 160 ? `${m.supersededBy.text.slice(0, 160)}…` : m.supersededBy.text;
+    return `[${isoDate(m.timestamp)} · SUPERSEDED on ${isoDate(m.supersededBy.timestamp)} by: "${by}"]`;
+  }
+  return `[${isoDate(m.timestamp)}${m.quiet ? ' · quiet' : ''}]`;
+}
+
+/** Standing agreements, verbatim, each with the id pin/unpin take. */
+export function formatPins(pins: PinRow[]): string {
+  if (pins.length === 0) return '';
+  return `# Pinned\n_Standing agreements, kept word for word and always current. They outrank anything older that seems to say otherwise._\n\n${pins.map(p => `- [p${p.id}] ${p.text}`).join('\n')}`;
+}
+
+/** Unfinished work, oldest first, plus what closed in the last two days. */
+export function formatLoops(open: LoopRow[], recentlyClosed: LoopRow[]): string {
+  if (open.length === 0 && recentlyClosed.length === 0) return '';
+  const lines = open.map(l => `- [l${l.id} · since ${isoDate(l.openedAt)}] ${l.text}`);
+  const closed = recentlyClosed.map(l => `- [l${l.id} · closed ${isoDate(l.closedAt!)}] ${l.text}${l.outcome ? ` → ${l.outcome}` : ''}`);
+  const parts = [`# Open loops\n_Unfinished work. close_loop when one is done._\n\n${lines.length > 0 ? lines.join('\n') : '_None open._'}`];
+  if (closed.length > 0) parts.push(`Recently closed:\n${closed.join('\n')}`);
+  return parts.join('\n\n');
 }
 
 /** Raw recall results — numbered, dated, best first. Observations are receipts, summaries are arcs. Agent synthesizes. */
@@ -59,16 +79,71 @@ export function formatRecall(matches: ObservationMatch[]): string {
  * character budget so a busy stretch can't blow the context window.
  */
 export function formatRecentNotes(obs: ObservationRow[], capChars = 6000): string {
-  if (obs.length === 0) return '';
+  return recentNoteLines(obs, capChars).join('\n');
+}
+
+function recentNoteLines(obs: ObservationRow[], capChars: number): string[] {
   const lines: string[] = [];
   let used = 0;
   for (const o of obs) {
-    const line = `- [${isoDate(o.timestamp)}] ${o.text}`;
+    const line = `- [${isoDate(o.timestamp)}] ${o.text}${correctionNote(o)}`;
     if (used + line.length > capChars && lines.length > 0) break;
     lines.push(line);
     used += line.length + 1;
   }
-  return lines.join('\n');
+  return lines;
+}
+
+/**
+ * The one-line trace a correction carries of what it replaced, e.g.
+ * ` [corrects 2026-11-10: "Tiling stays on for every workspace."]`. The old
+ * note stays hidden as current memory; this keeps a flip-flop visible.
+ */
+export function correctionNote(o: ObservationRow): string {
+  if (!o.corrects || o.corrects.length === 0) return '';
+  const shown = o.corrects.slice(-2).map(c => `${isoDate(c.timestamp)}: "${firstSentence(c.text, 90)}"`);
+  const more = o.corrects.length > 2 ? ` +${o.corrects.length - 2} more` : '';
+  return ` [corrects ${shown.join('; ')}${more}]`;
+}
+
+/** A note's first sentence, cut to `max` chars — the fallback gist for a day with no digest yet. */
+function firstSentence(text: string, max = 110): string {
+  const m = text.match(/^.*?[.!?](\s|$)/);
+  const s = (m ? m[0] : text).trim();
+  return s.length > max ? `${s.slice(0, max).trimEnd()}…` : s;
+}
+
+/**
+ * load_memory's continuity block: the latest active day verbatim (newest
+ * first, capped by characters, with a count of what the cap held back), then
+ * each earlier active day as one line: its digest, or, until the digest is
+ * written, the first sentences of its newest few notes. One busy day can no
+ * longer push the rest of the week out.
+ */
+export function formatRecentDays(
+  recent: RecentDays,
+  digests: Map<string, { text: string; sourceCount: number }>,
+  capChars = 6000,
+): string {
+  if (!recent.latestDay || recent.latest.length === 0) return '';
+  const parts: string[] = [];
+  const shown = recentNoteLines(recent.latest, capChars);
+  const shownCount = shown.length;
+  const n = recent.latest.length;
+  parts.push(`## ${recent.latestDay} — latest day, verbatim (${n} note${n === 1 ? '' : 's'})\n${shown.join('\n')}`);
+  if (shownCount < n) parts.push(`_+${n - shownCount} earlier note${n - shownCount === 1 ? '' : 's'} from ${recent.latestDay} not shown; recall finds them._`);
+  if (recent.earlier.length > 0) {
+    const lines = recent.earlier.map(({ day, notes }) => {
+      const count = `${notes.length} note${notes.length === 1 ? '' : 's'}`;
+      const d = digests.get(day);
+      if (d && d.sourceCount === notes.length) return `- ${day} (${count}): ${d.text}`;
+      const gist = notes.slice(0, 3).map(o => firstSentence(o.text)).join(' · ');
+      const more = notes.length > 3 ? ` · +${notes.length - 3} more` : '';
+      return `- ${day} (${count}, digest pending): ${gist}${more}`;
+    });
+    parts.push(`## Earlier days — one digest each\n${lines.join('\n')}`);
+  }
+  return parts.join('\n\n');
 }
 
 /**
@@ -104,15 +179,51 @@ export function formatModelView(
   if (recentObs.length > 0) {
     const ordered = [...recentObs].sort((a, b) => a.timestamp - b.timestamp); // oldest→newest
     parts.push('\nRecent notes (verbatim):');
-    for (const o of ordered) parts.push(`- [${isoDate(o.timestamp)}${o.covered ? ' · also summarized above' : ''}] ${o.text}`);
+    for (const o of ordered) parts.push(`- [${isoDate(o.timestamp)}${o.covered ? ' · also summarized above' : ''}] ${o.text}${correctionNote(o)}`);
   }
   return parts.join('\n');
 }
 
-/** The model index — every active model, for agent-as-router picks. */
-export function formatModelIndex(models: ModelRow[]): string {
+/** "today", "yesterday", "12d ago", "4mo ago" — how long since a timestamp. */
+export function ago(ts: number, now: number = Date.now()): string {
+  const days = Math.floor((now - ts) / DAY_MS);
+  if (days <= 0) return 'today';
+  if (days === 1) return 'yesterday';
+  if (days < 60) return `${days}d ago`;
+  return `${Math.round(days / 30)}mo ago`;
+}
+
+/** Index lines carry a description cut to this length: enough to route, not the whole lens. */
+export const INDEX_DESC_CHARS = 140;
+
+function clip(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const sp = cut.lastIndexOf(' ');
+  return `${(sp > max * 0.6 ? cut.slice(0, sp) : cut).trimEnd()}…`;
+}
+
+/**
+ * The model index — every active model, for agent-as-router picks. With
+ * `activity`, each line ends in its note count and newest note date, so a
+ * stale description (says "active", last note four months ago) shows itself.
+ */
+export function formatModelIndex(
+  models: ModelRow[],
+  activity?: Map<string, { obsCount: number; latest: number | null }>,
+  now: number = Date.now(),
+): string {
   if (models.length === 0) return '';
   const sorted = [...models].sort((a, b) => a.name.localeCompare(b.name));
-  const lines = sorted.map(m => `- ${m.name}: ${m.description ?? ''}`.trimEnd());
-  return `# Model index\n_The mental models available. Pass any of these names to load_model to pull its view._\n\n${lines.join('\n')}`;
+  const meta = (m: ModelRow): string => {
+    if (!activity) return '';
+    const a = activity.get(m.id);
+    if (!a || a.obsCount === 0 || a.latest === null) return ' [no notes yet]';
+    return ` [${a.obsCount} obs · last ${isoDate(a.latest)}, ${ago(a.latest, now)}]`;
+  };
+  const lines = sorted.map(m => `- ${m.name}: ${clip(m.description ?? '', INDEX_DESC_CHARS)}`.trimEnd() + meta(m));
+  const legend = activity
+    ? ' Brackets show how many notes back each model and when the newest was written; an old date means its description may be out of date.'
+    : '';
+  return `# Model index\n_The mental models available. Pass any of these names to load_model to pull its view.${legend}_\n\n${lines.join('\n')}`;
 }

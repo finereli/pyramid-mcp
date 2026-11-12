@@ -15,7 +15,7 @@ import { DurableObject } from 'cloudflare:workers';
 import { handleMcpRequest } from './mcp.js';
 import { synthesize } from './synth.js';
 import { embed, embedOne, EMBEDDING_DIM } from './embeddings.js';
-import { batchTier0, batchRollup, buildTier0Job, buildRollupJob, stubSynthesize, type SynthJob } from './pyramid.js';
+import { batchTier0, batchRollup, buildTier0Job, buildRollupJob, buildDayDigestJob, stubSynthesize, type SynthJob } from './pyramid.js';
 
 export interface Env {
   MEMORY_DO: DurableObjectNamespace<MemoryDO>;
@@ -55,6 +55,10 @@ export interface ObservationRow {
   source: string;
   /** Set on view rows only: this observation is already inside a tier-0 summary shown above (resolution ramp). */
   covered?: boolean;
+  /** Recall rows only: a quiet note (kept out of loaded views; recall still finds it). */
+  quiet?: boolean;
+  /** Set on read-path rows only: the earlier notes this one superseded, oldest first, so a correction carries its history. */
+  corrects?: Array<{ timestamp: number; text: string }>;
 }
 
 export interface SummaryRow {
@@ -85,11 +89,29 @@ export interface ObservationMatch {
   tier?: number;         // summaries only
   startTimestamp?: number; // summaries only
   obsCount?: number;     // summaries only: raw observations behind it, through all tiers
+  supersededBy?: { timestamp: number; text: string }; // observations only: a later note corrected this one
+  quiet?: boolean;       // observations only: kept out of loaded views
 }
+
+export interface PinRow { id: number; text: string; createdAt: number; updatedAt: number }
+export interface LoopRow { id: number; text: string; openedAt: number; closedAt: number | null; outcome: string | null }
 
 export interface SummarySource { type: 'observation' | 'summary'; id: string }
 
 export interface AdvanceResult { tier0: number; rollups: number; remaining: boolean }
+
+export interface RecentDays {
+  latestDay: string | null;
+  latest: ObservationRow[];                                   // newest first
+  earlier: Array<{ day: string; notes: ObservationRow[] }>;   // newest day first, notes newest first
+}
+
+/** Earlier active days shown as digests under the latest day, and how far back to look for them. */
+const RECENT_EARLIER_DAYS = 6;
+const RECENT_WINDOW_DAYS = 14;
+
+/** The calendar day (UTC) an observation belongs to, for the recent-days block. */
+export function dayKey(ts: number): string { return new Date(ts).toISOString().slice(0, 10); }
 
 /**
  * Summaries are immutable once written, so a degenerate synthesis result
@@ -102,6 +124,14 @@ export function checkSynthOutput(text: string): string {
   if (t.length < MIN_SUMMARY_CHARS) throw new Error(`synthesis returned degenerate output (${t.length} chars)`);
   return t;
 }
+
+/** A non-seed model with fewer notes than this is sparse: a fold candidate. */
+const SPARSE_FLOOR = 5;
+
+/** Minimum quote length for finding a note to supersede; shorter quotes match too much. */
+export const MIN_QUOTE_CHARS = 12;
+/** Recall ranks a superseded note below its live neighbours by this much (scores are 0..~1, lower = better). */
+const SUPERSEDED_PENALTY = 0.1;
 
 const DEDUP_WINDOW_MS = 24 * 3600 * 1000;
 const DEDUP_PREFIX_CHARS = 80;
@@ -171,6 +201,33 @@ export class MemoryDO extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS idx_ss_source ON summary_sources(source_type, source_id);
       CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE IF NOT EXISTS day_digests (
+        day          TEXT PRIMARY KEY,
+        text         TEXT NOT NULL,
+        source_count INTEGER NOT NULL,
+        created_at   INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS supersessions (
+        old_id    TEXT PRIMARY KEY,
+        new_id    TEXT NOT NULL,
+        timestamp INTEGER NOT NULL
+      );
+      -- Standing agreements: never summarized, never aged out, always loaded.
+      CREATE TABLE IF NOT EXISTS pins (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        text       TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        removed_at INTEGER
+      );
+      -- Unfinished work, open until explicitly closed.
+      CREATE TABLE IF NOT EXISTS loops (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        text      TEXT NOT NULL,
+        opened_at INTEGER NOT NULL,
+        closed_at INTEGER,
+        outcome   TEXT
+      );
     `);
     // Add columns introduced after the initial schema, for DOs created earlier.
     try { this.sql.exec('ALTER TABLE models ADD COLUMN last_summarized_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already present */ }
@@ -179,6 +236,8 @@ export class MemoryDO extends DurableObject<Env> {
     // summary through all tiers. NULL marks pre-migration rows for backfill.
     try { this.sql.exec('ALTER TABLE summaries ADD COLUMN obs_count INTEGER'); } catch { /* already present */ }
     try { this.sql.exec('ALTER TABLE summaries ADD COLUMN source_chars INTEGER'); } catch { /* already present */ }
+    // Quiet notes: findable by recall, kept out of everything loaded by default.
+    try { this.sql.exec('ALTER TABLE observations ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0'); } catch { /* already present */ }
     // Migration from the time-window pyramid (pre Aug 2026): a summary without
     // provenance rows is invalid in this design — nothing can be covered by it
     // and nothing can roll it up. Drop any such rows; the pyramid regrows
@@ -301,6 +360,20 @@ export class MemoryDO extends DurableObject<Env> {
     return rows.map(toModelRow);
   }
 
+  /**
+   * Note count and newest note per model, in one grouped query — what the
+   * model index shows next to each description, so a description that has
+   * gone stale ("active", but nothing recorded in months) is visible at a glance.
+   */
+  modelActivity(): Map<string, { obsCount: number; latest: number | null }> {
+    const rows = this.sql.exec(
+      `SELECT t.model_id AS id, COUNT(*) AS c, MAX(o.timestamp) AS latest
+       FROM observation_tags t JOIN observations o ON o.id = t.observation_id
+       GROUP BY t.model_id`,
+    ).toArray() as Array<{ id: string; c: number; latest: number | null }>;
+    return new Map(rows.map(r => [r.id, { obsCount: r.c, latest: r.latest }]));
+  }
+
   getModel(name: string): ModelRow | undefined {
     const row = this.sql
       .exec('SELECT id, name, description, is_seed, archived, created_at FROM models WHERE name = ?', name)
@@ -345,6 +418,7 @@ export class MemoryDO extends DurableObject<Env> {
     modelNames: string[],
     source = 'direct',
     embedding?: number[],
+    quiet = false,
   ): AddObservationResult {
     if (modelNames.length === 0) return { ok: false, unknown: [] };
 
@@ -363,8 +437,8 @@ export class MemoryDO extends DurableObject<Env> {
     const timestamp = Date.now();
     const blob = embedding ? floatsToBlob(normalizeVec(embedding)) : null;
     this.sql.exec(
-      'INSERT INTO observations (id, text, timestamp, source, embedding) VALUES (?, ?, ?, ?, ?)',
-      id, text, timestamp, source, blob,
+      'INSERT INTO observations (id, text, timestamp, source, embedding, quiet) VALUES (?, ?, ?, ?, ?, ?)',
+      id, text, timestamp, source, blob, quiet ? 1 : 0,
     );
     for (const name of modelNames) {
       this.sql.exec(
@@ -398,6 +472,146 @@ export class MemoryDO extends DurableObject<Env> {
       }
     }
     return { models: models.length, observations: oCount, tags: tCount };
+  }
+
+  // ---------- Supersession (corrections) ----------
+  //
+  // Observations are never edited or deleted. A correction is a NEW
+  // observation plus a supersessions row pointing old → new. The old note
+  // stays in the store and in recall (labeled), but drops out of everything
+  // that presents memory as current: recent notes, the verbatim tail of a
+  // model view, and — marked as history — the tier-0 prompt that compresses it.
+
+  /**
+   * Live (not yet superseded) observations containing `quote`, case-insensitive,
+   * newest first. How the agent points at an old note without seeing ids.
+   */
+  findObservationsByQuote(quote: string, limit = 5): ObservationRow[] {
+    const rows = this.sql.exec(
+      `SELECT id, text, timestamp, source FROM observations
+       WHERE instr(lower(text), lower(?)) > 0
+         AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)
+       ORDER BY timestamp DESC, rowid DESC LIMIT ?`,
+      quote, limit,
+    ).toArray() as Array<Record<string, unknown>>;
+    return rows.map(toObservationRow);
+  }
+
+  /** Mark old observations as superseded by a newer one. Idempotent per old id (first correction wins). */
+  markSuperseded(oldIds: string[], newId: string): number {
+    let n = 0;
+    for (const old of oldIds) {
+      if (old === newId) continue;
+      n += this.sql.exec('INSERT OR IGNORE INTO supersessions (old_id, new_id, timestamp) VALUES (?, ?, ?) RETURNING old_id', old, newId, Date.now()).toArray().length; // rowsWritten would count index writes too
+    }
+    return n;
+  }
+
+  /** Which of these observation ids are superseded. */
+  supersededAmong(ids: string[]): Set<string> {
+    if (ids.length === 0) return new Set();
+    const rows = this.sql.exec(`SELECT old_id FROM supersessions WHERE old_id IN (${placeholders(ids.length)})`, ...ids)
+      .toArray() as Array<{ old_id: string }>;
+    return new Set(rows.map(r => r.old_id));
+  }
+
+  // ---------- Quiet notes ----------
+
+  /**
+   * Make notes quiet: kept out of recent notes, model views and future
+   * summaries; recall still finds them. Returns, per id, whether a summary
+   * already holds it (a summary is immutable, so that copy stays).
+   */
+  markQuiet(ids: string[]): Array<{ id: string; alreadySummarized: boolean }> {
+    return ids.map(id => {
+      this.sql.exec('UPDATE observations SET quiet = 1 WHERE id = ?', id);
+      const held = this.sql.exec(
+        "SELECT COUNT(*) AS n FROM summary_sources WHERE source_type = 'observation' AND source_id = ?", id,
+      ).one() as { n: number };
+      return { id, alreadySummarized: held.n > 0 };
+    });
+  }
+
+  // ---------- Pins (standing agreements) ----------
+
+  listPins(): PinRow[] {
+    return (this.sql.exec('SELECT id, text, created_at, updated_at FROM pins WHERE removed_at IS NULL ORDER BY id ASC')
+      .toArray() as Array<{ id: number; text: string; created_at: number; updated_at: number }>)
+      .map(r => ({ id: r.id, text: r.text, createdAt: r.created_at, updatedAt: r.updated_at }));
+  }
+
+  addPin(text: string): number {
+    const now = Date.now();
+    const row = this.sql.exec('INSERT INTO pins (text, created_at, updated_at) VALUES (?, ?, ?) RETURNING id', text, now, now).one() as { id: number };
+    return row.id;
+  }
+
+  /** Reword a live pin in place. False if there is no live pin with that id. */
+  editPin(id: number, text: string): boolean {
+    return this.sql.exec('UPDATE pins SET text = ?, updated_at = ? WHERE id = ? AND removed_at IS NULL RETURNING id', text, Date.now(), id).toArray().length > 0;
+  }
+
+  /** Retire a pin (kept in the table, no longer loaded). False if there is no live pin with that id. */
+  removePin(id: number): boolean {
+    return this.sql.exec('UPDATE pins SET removed_at = ? WHERE id = ? AND removed_at IS NULL RETURNING id', Date.now(), id).toArray().length > 0;
+  }
+
+  // ---------- Open loops ----------
+
+  /** Open loops oldest first, then loops closed within `closedWithinMs` (newest first) for continuity. */
+  listLoops(closedWithinMs = 2 * 86_400_000): { open: LoopRow[]; recentlyClosed: LoopRow[] } {
+    const map = (rows: unknown[]) => (rows as Array<{ id: number; text: string; opened_at: number; closed_at: number | null; outcome: string | null }>)
+      .map(r => ({ id: r.id, text: r.text, openedAt: r.opened_at, closedAt: r.closed_at, outcome: r.outcome }));
+    return {
+      open: map(this.sql.exec('SELECT id, text, opened_at, closed_at, outcome FROM loops WHERE closed_at IS NULL ORDER BY id ASC').toArray()),
+      recentlyClosed: map(this.sql.exec('SELECT id, text, opened_at, closed_at, outcome FROM loops WHERE closed_at >= ? ORDER BY closed_at DESC', Date.now() - closedWithinMs).toArray()),
+    };
+  }
+
+  openLoop(text: string): number {
+    const row = this.sql.exec('INSERT INTO loops (text, opened_at) VALUES (?, ?) RETURNING id', text, Date.now()).one() as { id: number };
+    return row.id;
+  }
+
+  /** Close an open loop. Returns its text, or null if there is no open loop with that id. */
+  closeLoop(id: number, outcome?: string): string | null {
+    const rows = this.sql.exec('UPDATE loops SET closed_at = ?, outcome = ? WHERE id = ? AND closed_at IS NULL RETURNING text', Date.now(), outcome ?? null, id).toArray() as Array<{ text: string }>;
+    return rows[0]?.text ?? null;
+  }
+
+  /**
+   * Read path: attach to each row the notes it superseded (oldest first), so
+   * a correction shows what it replaced instead of the old note silently
+   * vanishing. Mutates and returns the rows.
+   */
+  attachCorrections<T extends ObservationRow>(rows: T[]): T[] {
+    if (rows.length === 0) return rows;
+    const found = this.sql.exec(
+      `SELECT sp.new_id, o.timestamp, o.text FROM supersessions sp JOIN observations o ON o.id = sp.old_id
+       WHERE sp.new_id IN (${placeholders(rows.length)}) ORDER BY o.timestamp ASC`,
+      ...rows.map(r => r.id),
+    ).toArray() as Array<{ new_id: string; timestamp: number; text: string }>;
+    const byNew = new Map<string, Array<{ timestamp: number; text: string }>>();
+    for (const f of found) {
+      if (!byNew.has(f.new_id)) byNew.set(f.new_id, []);
+      byNew.get(f.new_id)!.push({ timestamp: f.timestamp, text: f.text });
+    }
+    for (const r of rows) {
+      const c = byNew.get(r.id);
+      if (c) r.corrects = c;
+    }
+    return rows;
+  }
+
+  /** For recall labels: when each superseded id was replaced, and by what. */
+  supersessionInfo(ids: string[]): Map<string, { timestamp: number; text: string }> {
+    if (ids.length === 0) return new Map();
+    const rows = this.sql.exec(
+      `SELECT sp.old_id, sp.timestamp, o.text FROM supersessions sp JOIN observations o ON o.id = sp.new_id
+       WHERE sp.old_id IN (${placeholders(ids.length)})`,
+      ...ids,
+    ).toArray() as Array<{ old_id: string; timestamp: number; text: string }>;
+    return new Map(rows.map(r => [r.old_id, { timestamp: r.timestamp, text: r.text }]));
   }
 
   setObservationEmbedding(observationId: string, embedding: number[]): void {
@@ -434,9 +648,15 @@ export class MemoryDO extends DurableObject<Env> {
       return (1 - sim) * (1 - timeWeight) + computeTimePenalty(ts, now) * timeWeight;
     };
     const obs = this.sql
-      .exec('SELECT id, text, timestamp, embedding FROM observations WHERE embedding IS NOT NULL')
-      .toArray() as Array<{ id: string; text: string; timestamp: number; embedding: ArrayBuffer }>;
-    const scored: ObservationMatch[] = obs.map(r => ({ id: r.id, text: r.text, timestamp: r.timestamp, score: score(r.embedding, r.timestamp), kind: 'observation' as const }));
+      .exec('SELECT id, text, timestamp, quiet, embedding FROM observations WHERE embedding IS NOT NULL')
+      .toArray() as Array<{ id: string; text: string; timestamp: number; quiet: number; embedding: ArrayBuffer }>;
+    const superseded = new Set((this.sql.exec('SELECT old_id FROM supersessions').toArray() as Array<{ old_id: string }>).map(r => r.old_id));
+    const scored: ObservationMatch[] = obs.map(r => ({
+      id: r.id, text: r.text, timestamp: r.timestamp, kind: 'observation' as const,
+      ...(r.quiet ? { quiet: true } : {}),
+      // Corrections outrank what they corrected; the old note stays findable.
+      score: score(r.embedding, r.timestamp) + (superseded.has(r.id) ? SUPERSEDED_PENALTY : 0),
+    }));
 
     if (includeSummaries) {
       // Arcs, not just receipts: summaries are searchable too. Recency uses the
@@ -449,7 +669,13 @@ export class MemoryDO extends DurableObject<Env> {
       }
     }
     scored.sort((a, b) => a.score - b.score);
-    return scored.slice(0, limit);
+    const top = scored.slice(0, limit);
+    const info = this.supersessionInfo(top.filter(m => m.kind === 'observation' && superseded.has(m.id)).map(m => m.id));
+    for (const m of top) {
+      const s = info.get(m.id);
+      if (s) m.supersededBy = s;
+    }
+    return top;
   }
 
   /** Prefix-match dedup against observations from the last 24h. */
@@ -525,6 +751,7 @@ export class MemoryDO extends DurableObject<Env> {
        FROM observations o
        JOIN observation_tags t ON t.observation_id = o.id
        WHERE t.model_id = ?
+         AND o.quiet = 0 -- quiet notes are never summarized or shown; recall finds them
          AND NOT EXISTS (
            SELECT 1 FROM summary_sources ss JOIN summaries s ON s.id = ss.summary_id
            WHERE ss.source_type = 'observation' AND ss.source_id = o.id AND s.model_id = ?
@@ -549,9 +776,15 @@ export class MemoryDO extends DurableObject<Env> {
     return rows.map(toSummaryRow);
   }
 
-  /** The verbatim tail for the read path: the model's newest unsummarized observations, newest first. */
+  /**
+   * The verbatim tail for the read path: the model's newest unsummarized
+   * observations, newest first. Superseded notes are left out — the view
+   * presents memory as current, and the correction is in the tail instead.
+   */
   listTailForModel(modelId: string, limit: number): ObservationRow[] {
-    return this.unsummarizedObservations(modelId).slice(-limit).reverse();
+    const unsummarized = this.unsummarizedObservations(modelId);
+    const superseded = this.supersededAmong(unsummarized.map(o => o.id));
+    return this.attachCorrections(unsummarized.filter(o => !superseded.has(o.id)).slice(-limit).reverse());
   }
 
   /**
@@ -590,6 +823,8 @@ export class MemoryDO extends DurableObject<Env> {
          WHERE t.model_id = ?
            AND EXISTS (SELECT 1 FROM summary_sources ss JOIN summaries s ON s.id = ss.summary_id
                        WHERE ss.source_type = 'observation' AND ss.source_id = o.id AND s.model_id = ?)
+           AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = o.id)
+           AND o.quiet = 0
          ORDER BY o.timestamp DESC, o.rowid DESC LIMIT ?`,
         modelId, modelId, need,
       ).toArray() as Array<Record<string, unknown>>;
@@ -737,7 +972,7 @@ export class MemoryDO extends DurableObject<Env> {
     const { batches } = batchTier0(this.unsummarizedObservations(modelId));
     for (const batch of batches) {
       if (calls >= maxCalls) { result.remaining = true; return result; }
-      const job = buildTier0Job(model, batch);
+      const job = buildTier0Job(model, batch, this.supersededAmong(batch.map(o => o.id)));
       const text = checkSynthOutput(await this.runSynth(job)); calls++;
       await this.insertSummary(modelId, { tier: 0, text, startTimestamp: job.startTs, endTimestamp: job.endTs, sourceCount: job.sourceIds.length },
         job.sourceIds.map(id => ({ type: 'observation' as const, id })));
@@ -822,10 +1057,90 @@ export class MemoryDO extends DurableObject<Env> {
    */
   recentObservations(limit = 30): ObservationRow[] {
     const rows = this.sql.exec(
-      'SELECT id, text, timestamp, source FROM observations ORDER BY timestamp DESC, rowid DESC LIMIT ?',
+      `SELECT id, text, timestamp, source FROM observations
+       WHERE NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)
+       ORDER BY timestamp DESC, rowid DESC LIMIT ?`,
       limit,
     ).toArray() as Array<Record<string, unknown>>;
     return rows.map(toObservationRow);
+  }
+
+  // ---------- Recent days (load_memory's continuity block) ----------
+  //
+  // A flat "newest N notes" block let one busy day push the whole week out.
+  // Instead: the latest active day verbatim, and each earlier active day in
+  // the window as one short digest. Digests are a view cache, not the record
+  // (unlike summaries they are regenerated when a day's live notes change);
+  // the observations stay the source of truth. Days are UTC calendar days.
+
+  /** Live notes of the latest active day (newest first), plus earlier active days in the window. */
+  recentDays(maxEarlierDays = RECENT_EARLIER_DAYS, windowDays = RECENT_WINDOW_DAYS): RecentDays {
+    const newest = this.sql.exec(
+      'SELECT MAX(timestamp) AS ts FROM observations WHERE quiet = 0 AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)',
+    ).one() as { ts: number | null };
+    if (newest.ts === null) return { latestDay: null, latest: [], earlier: [] };
+    const latestDay = dayKey(newest.ts);
+    const since = Date.parse(`${latestDay}T00:00:00Z`) - windowDays * 86_400_000;
+    const rows = (this.sql.exec(
+      `SELECT id, text, timestamp, source FROM observations
+       WHERE timestamp >= ? AND quiet = 0 AND NOT EXISTS (SELECT 1 FROM supersessions sp WHERE sp.old_id = observations.id)
+       ORDER BY timestamp DESC, rowid DESC`,
+      since,
+    ).toArray() as Array<Record<string, unknown>>).map(toObservationRow);
+    this.attachCorrections(rows);
+    const byDay = new Map<string, ObservationRow[]>();
+    for (const o of rows) {
+      const k = dayKey(o.timestamp);
+      if (!byDay.has(k)) byDay.set(k, []);
+      byDay.get(k)!.push(o);
+    }
+    const earlier = [...byDay.entries()]
+      .filter(([d]) => d !== latestDay)
+      .slice(0, maxEarlierDays)
+      .map(([day, notes]) => ({ day, notes }));
+    return { latestDay, latest: byDay.get(latestDay) ?? [], earlier };
+  }
+
+  /** Stored digests for these days. */
+  getDayDigests(days: string[]): Map<string, { text: string; sourceCount: number }> {
+    if (days.length === 0) return new Map();
+    const rows = this.sql.exec(`SELECT day, text, source_count FROM day_digests WHERE day IN (${placeholders(days.length)})`, ...days)
+      .toArray() as Array<{ day: string; text: string; source_count: number }>;
+    return new Map(rows.map(r => [r.day, { text: r.text, sourceCount: r.source_count }]));
+  }
+
+  private digesting: Promise<number> | null = null;
+
+  /**
+   * Write or refresh the digest of each earlier day whose live note count
+   * changed (or that has none), newest day first, at most `maxCalls` LLM calls.
+   * Runs in the background from load_memory; one run at a time. Returns how
+   * many digests were written. A failed synthesis leaves that day on its
+   * fallback gist and is retried next time.
+   */
+  async ensureDayDigests(maxCalls = 2): Promise<number> {
+    if (this.digesting) return this.digesting;
+    const run = (async () => {
+      const { earlier } = this.recentDays();
+      const have = this.getDayDigests(earlier.map(d => d.day));
+      let written = 0;
+      for (const { day, notes } of earlier) {
+        if (written >= maxCalls) break;
+        if (have.get(day)?.sourceCount === notes.length) continue;
+        try {
+          const text = checkSynthOutput(await this.runSynth(buildDayDigestJob(day, notes)));
+          this.sql.exec(
+            `INSERT INTO day_digests (day, text, source_count, created_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(day) DO UPDATE SET text = excluded.text, source_count = excluded.source_count, created_at = excluded.created_at`,
+            day, text, notes.length, Date.now(),
+          );
+          written++;
+        } catch (e) { console.error(`[digest] ${day} failed:`, e); break; }
+      }
+      return written;
+    })();
+    this.digesting = run;
+    try { return await run; } finally { this.digesting = null; }
   }
 
   // ---------- Confidence / stats ----------
@@ -866,35 +1181,84 @@ export class MemoryDO extends DurableObject<Env> {
    * summarizing the source) tagged to the target, then archive the source. Source
    * seeds are protected. Reinforcement is intentional — the synthesis lands in the
    * target's recent tier.
+   *
+   * With `carryObservations` (the default) the source's observations are also
+   * tagged to the target, so they join its pyramid (as a fresh tail, batched
+   * by timestamp) instead of staying behind on an archived model that nothing
+   * loads. Nothing is copied or rewritten; it's one tag row per observation.
    */
-  foldModel(source: string, into: string, synthesis: string, embedding?: number[]): { ok: boolean; reason?: string } {
+  foldModel(source: string, into: string, synthesis: string, embedding?: number[], carryObservations = true): { ok: boolean; reason?: string; carried?: number } {
     if (isProtectedSeed(source)) return { ok: false, reason: `"${source}" is a protected seed model and can't be folded away.` };
     const s = this.getModel(source);
     const t = this.getModel(into);
     if (!s) return { ok: false, reason: `No model named "${source}".` };
     if (!t) return { ok: false, reason: `No model named "${into}".` };
+    if (s.id === t.id) return { ok: false, reason: 'A model cannot be folded into itself.' };
+    const carried = carryObservations
+      ? this.sql.exec('INSERT OR IGNORE INTO observation_tags (observation_id, model_id) SELECT observation_id, ? FROM observation_tags WHERE model_id = ? RETURNING observation_id', t.id, s.id).toArray().length
+      : 0;
     const id = crypto.randomUUID();
     const blob = embedding ? floatsToBlob(normalizeVec(embedding)) : null;
     this.sql.exec('INSERT INTO observations (id, text, timestamp, source, embedding) VALUES (?, ?, ?, ?, ?)', id, synthesis, Date.now(), 'fold', blob);
     this.sql.exec('INSERT OR IGNORE INTO observation_tags (observation_id, model_id) VALUES (?, ?)', id, t.id);
     this.sql.exec('UPDATE models SET archived = 1 WHERE id = ?', s.id);
-    return { ok: true };
+    return { ok: true, carried };
   }
 
   /**
    * Fragmentation signal for the defrag hint. Counts active models and how many
-   * (non-seed) are under-populated. (Centroid-similarity dedup is a later
-   * refinement; this cheap version drives the in-conversation nudge.)
+   * (non-seed) are under-populated, and names them so the hint can too.
    */
-  computeFragmentation(): { activeModels: number; underPopulated: number; fragmented: boolean } {
-    const FLOOR = 5;
+  computeFragmentation(): { activeModels: number; underPopulated: number; fragmented: boolean; sparse: string[] } {
     const models = this.listModels();
-    let under = 0;
-    for (const m of models) {
-      if (isProtectedSeed(m.name)) continue;
-      if (this.getModelConfidence(m.id).obsCount < FLOOR) under++;
+    const activity = this.modelActivity();
+    const sparse = models
+      .filter(m => !isProtectedSeed(m.name) && (activity.get(m.id)?.obsCount ?? 0) < SPARSE_FLOOR)
+      .map(m => m.name);
+    return { activeModels: models.length, underPopulated: sparse.length, fragmented: sparse.length >= 6 || models.length > 40, sparse };
+  }
+
+  /**
+   * Fold candidates: every sparse (non-seed, under SPARSE_FLOOR notes) active
+   * model with its closest active models by content — cosine similarity of
+   * the mean of each model's observation embeddings. Content, not names:
+   * "kali" and "hobbies" share no token but are plainly the same lens. The
+   * agent decides; this only ranks. Strongest match first.
+   */
+  suggestFolds(perModel = 2): Array<{ name: string; obsCount: number; latest: number | null; closest: Array<{ name: string; similarity: number }> }> {
+    const models = this.listModels();
+    const activity = this.modelActivity();
+    const nameById = new Map(models.map(m => [m.id, m.name]));
+    // Centroids: sum each model's unit vectors, then normalize.
+    const sums = new Map<string, Float64Array>();
+    const rows = this.sql.exec(
+      `SELECT t.model_id AS id, o.embedding FROM observation_tags t JOIN observations o ON o.id = t.observation_id
+       JOIN models m ON m.id = t.model_id
+       WHERE m.archived = 0 AND o.embedding IS NOT NULL`,
+    ).toArray() as Array<{ id: string; embedding: ArrayBuffer }>;
+    for (const r of rows) {
+      const v = blobToFloats(r.embedding);
+      let acc = sums.get(r.id);
+      if (!acc) { acc = new Float64Array(v.length); sums.set(r.id, acc); }
+      for (let i = 0; i < v.length && i < acc.length; i++) acc[i] = acc[i]! + v[i]!;
     }
-    return { activeModels: models.length, underPopulated: under, fragmented: under >= 6 || models.length > 40 };
+    const centroids = new Map<string, Float32Array>();
+    for (const [id, acc] of sums) centroids.set(id, new Float32Array(normalizeVec(Array.from(acc))));
+
+    const out = models
+      .filter(m => !isProtectedSeed(m.name) && (activity.get(m.id)?.obsCount ?? 0) < SPARSE_FLOOR)
+      .map(m => {
+        const cv = centroids.get(m.id);
+        const c = cv ? Array.from(cv) : null;
+        const closest = !c ? [] : [...centroids.entries()]
+          .filter(([id]) => id !== m.id && nameById.has(id))
+          .map(([id, v]) => ({ name: nameById.get(id)!, similarity: dot(c, v) }))
+          .sort((a, b) => b.similarity - a.similarity)
+          .slice(0, perModel);
+        const a = activity.get(m.id);
+        return { name: m.name, obsCount: a?.obsCount ?? 0, latest: a?.latest ?? null, closest };
+      });
+    return out.sort((a, b) => (b.closest[0]?.similarity ?? -1) - (a.closest[0]?.similarity ?? -1));
   }
 
   getStats(): { models: number; observations: number; summaries: number; embedded: number; summariesEmbedded: number; embeddingDim: number; observationSize: SizeStats; summarySize: SizeStats; perModel: ModelStats[] } {
@@ -1014,6 +1378,8 @@ export class MemoryDO extends DurableObject<Env> {
     this.sql.exec('DELETE FROM summaries');
     this.sql.exec('DELETE FROM models');
     this.sql.exec('DELETE FROM config');
+    this.sql.exec('DELETE FROM supersessions');
+    this.sql.exec('DELETE FROM day_digests');
     this.ensureSeedModels();
     return { cleared: true };
   }

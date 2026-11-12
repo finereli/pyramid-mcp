@@ -80,13 +80,15 @@ export function batchRollup(summaries: SummaryRow[]): SummaryRow[][] {
 // ---------- Prompts ----------
 
 const COMMON_RULES = `Rules that apply at every tier:
+- Voice: these are the agent's own memories, and the agent will read this summary as its own past. Write in the first person as the agent ("I"), the way someone writes a diary looking back, and call the user and everyone else by name. The observations are already in this voice; keep it. Never write a third-person report about the agent or the user ("Between May 3 and May 9, Tom navigated...", "The agent assisted with...").
+- Keep what things meant, not only what happened: why something mattered, how it landed, what it changed between us, what surprised me. One clause of meaning beside a fact is worth more than another fact. Meaning still has to come from the material; never add feelings nobody recorded.
 - Write from this model's lens (its name and purpose are given). Observations are multi-tagged; other models carry their own angle on the same events. Surface what matters for THIS lens.
 - Preserve the load-bearing specifics — names, numbers, dates, decisions, turning points, the participants' own phrasing. They are what makes a memory verifiable later, and what later tiers will have to work from. Drop filler, drop repetition, keep the facts.
 - Trace the arc with causal connective tissue: what developed, what shifted because of what, what is still open. Narrative, not a flat list.
 - Dates: write arcs as date ranges (e.g. "between Jun 6 and Jun 16") and discrete events as dates (e.g. "on Apr 17"). A window that falls on a single day is "on Jun 6", never "between Jun 6 and Jun 6". Dates should read as part of the narrative, not as labels.
 - Factual discipline: never invent a number, name, date, or relationship that is not in the material. An omission is correct; a confabulation corrupts everything built on top of this.
 - Hold to the target length. Use it fully when the material is rich - ten substantive observations deserve the whole budget, and leaving specifics out to come in short is a loss, not a virtue. Shorter is fine only when the material is genuinely thin.
-- Prefer concrete events, decisions, numbers, and names over characterizations. "Decided on May 10 to sell the house" beats "navigated major life decisions"; "closed Cristi at $4K/mo + 10%" beats "made progress on partnerships". At higher tiers this matters most: compress by dropping lesser events, not by turning events into adjectives.
+- Prefer concrete events, decisions, numbers, and names over characterizations. "On May 10 Dana decided to sell the house" beats "navigated major life decisions"; "I helped close Cristi at $4K/mo + 10%" beats "made progress on partnerships". At higher tiers this matters most: compress by dropping lesser events, not by turning events into adjectives.
 - Output ONLY the summary prose. No preamble, no headers, no closing line that sums up "overall" or speculates about the future.`;
 
 export const TIER0_SYSTEM = `You are the compression step in a pyramid memory system. You compress a batch of raw observations into one tier-0 summary for a SINGLE mental model.
@@ -101,8 +103,38 @@ The input summaries are preserved separately and stay searchable — you are bui
 
 ${COMMON_RULES}`;
 
+export const DAY_DIGEST_SYSTEM = `You write the digest of one day in a memory system: every note recorded that day, across all topics, compressed into one short paragraph. It sits under the latest day's full notes so the agent reading it keeps a sense of the past week without the week's full text. The notes stay searchable, so you are writing a pointer, not an archive.
+
+Rules:
+- Write in the first person as the agent whose memory this is ("I"), like a diary line about the day; call the user and others by name. No third-person report ("Tom worked on...", "The agent helped...") unless it is genuinely about what they did without me.
+- Cover the day's threads in order of weight: what got done or decided, what changed, what is still open. One clause per thread; a quiet day gets one sentence.
+- Keep the specifics that would let someone search for more: names, project names, numbers, decisions, the person's own phrasing.
+- Never invent anything that is not in the notes. Leaving something out is fine; making something up is not.
+- Hold to the target length.
+- Output ONLY the digest prose. No date heading, no preamble, no closing line.`;
+
+/** Soft target for a day digest, in characters. */
+export const DAY_DIGEST_TARGET_CHARS = 450;
+
+/** One UTC day of live notes (any order) → one digest job. */
+export function buildDayDigestJob(day: string, notes: ObservationRow[]): SynthJob {
+  const sorted = [...notes].sort((a, b) => a.timestamp - b.timestamp);
+  const body = sorted.map(o => `- [${new Date(o.timestamp).toISOString().slice(11, 16)} UTC] ${o.text}`).join('\n');
+  const user = `Day: ${day} (${sorted.length} notes)
+
+Notes, oldest first:
+${body}
+
+Write a ~${DAY_DIGEST_TARGET_CHARS}-character digest of this day.`;
+  return {
+    kind: 'digest', tier: 0, system: DAY_DIGEST_SYSTEM, user,
+    maxTokens: Math.ceil((DAY_DIGEST_TARGET_CHARS * 2.5) / 3.5), targetChars: DAY_DIGEST_TARGET_CHARS,
+    startTs: sorted[0]!.timestamp, endTs: sorted[sorted.length - 1]!.timestamp, sourceIds: sorted.map(o => o.id),
+  };
+}
+
 export interface SynthJob {
-  kind: 'tier0' | 'rollup';
+  kind: 'tier0' | 'rollup' | 'digest';
   tier: number;            // depth of the summary being produced
   system: string;
   user: string;
@@ -113,19 +145,30 @@ export interface SynthJob {
   sourceIds: string[];     // observation ids (tier0) or summary ids (rollup)
 }
 
-export function buildTier0Job(model: ModelRow, batch: ObservationRow[]): SynthJob {
+/** Marks an observation a later note corrected, in the tier-0 prompt. */
+export const SUPERSEDED_MARK = '(SUPERSEDED: a later note corrected this)';
+
+/**
+ * Every observation is summarized exactly once, superseded or not; a
+ * superseded one goes in marked, so the summary can keep it as history
+ * ("first tried X") without presenting it as the current state.
+ */
+export function buildTier0Job(model: ModelRow, batch: ObservationRow[], superseded: ReadonlySet<string> = new Set()): SynthJob {
   const sorted = [...batch].sort((a, b) => a.timestamp - b.timestamp);
   const startTs = sorted[0]!.timestamp;
   const endTs = sorted[sorted.length - 1]!.timestamp;
   const target = targetCharsForTier(0);
-  const body = sorted.map(o => `- [${isoDate(o.timestamp)}] ${o.text}`).join('\n');
+  const body = sorted.map(o => `- [${isoDate(o.timestamp)}] ${superseded.has(o.id) ? `${SUPERSEDED_MARK} ` : ''}${o.text}`).join('\n');
+  const note = sorted.some(o => superseded.has(o.id))
+    ? `\nObservations marked ${SUPERSEDED_MARK} were later corrected or replaced. Don't present them as current; mention them only as history if they matter to the arc.\n`
+    : '';
   const user = `Model: ${model.name}
 Purpose: ${model.description ?? model.name}
 Window: ${rangeLabel(startTs, endTs)} (${sorted.length} observations)
 
 Observations, oldest first:
 ${body}
-
+${note}
 Write a ~${target}-character tier-0 summary of this window through the "${model.name}" lens.`;
   return { kind: 'tier0', tier: 0, system: TIER0_SYSTEM, user, maxTokens: ceilingTokensForTier(0), targetChars: target, startTs, endTs, sourceIds: sorted.map(o => o.id) };
 }

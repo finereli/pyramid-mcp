@@ -8,18 +8,20 @@
  * in-DO instance, so they're synchronous). Embedding goes through the DO's
  * `env.AI` binding (Workers AI bge-m3) — no per-user key, nothing to forward.
  */
-import { normName, type MemoryDO } from './memory-do.js';
-import { formatRecall, formatRecentNotes, formatModelView, formatModelIndex } from './format.js';
+import { normName, MIN_QUOTE_CHARS, type MemoryDO, type ModelRow } from './memory-do.js';
+import { formatRecall, formatRecentDays, formatModelView, formatModelIndex, formatPins, formatLoops } from './format.js';
 import { renderWithBudget } from './pyramid.js';
 
 const RECALL_LIMIT = 15;
-const RECENT_NOTES_COUNT = 30;
 const MODEL_VIEW_OBS = 15;
 /** Resolution ramp: newest covered summaries shown per lower tier, and newest observations always shown verbatim. */
 const RAMP_PER_TIER = 2;
 const RAMP_VERBATIM = 5;
 /** Per-model render budget (chars). Generous by design — it shapes a pathological view, it does not drop data from the store. */
 const MODEL_VIEW_BUDGET_CHARS = 16_000;
+/** load_memory's compact core views: the cover and the newest few notes, within this budget. load_model gives the full view. */
+const CORE_VIEW_BUDGET_CHARS = 4_000;
+const CORE_VIEW_OBS = 3;
 
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 const SERVER_INFO = { name: 'pyramid-mcp', version: '0.0.1' };
@@ -31,9 +33,15 @@ const SERVER_INFO = { name: 'pyramid-mcp', version: '0.0.1' };
  */
 export const SERVER_INSTRUCTIONS = `This server is your long-term memory.
 
-Loading memory takes TWO steps, always. At the START of a conversation, call \`load_memory\` — it returns the model index (the map of what this memory holds) and recent notes for continuity, but no memories themselves. Then read the index, pick every model relevant to what the user is raising, and call \`load_model\` once per model (the calls can run in parallel). A \`load_memory\` call on its own has loaded nothing; do not skip the second step. When the topic shifts mid-conversation, call \`load_model\` again for models that just became relevant.
+Loading memory takes TWO steps, always. At the START of a conversation, call \`load_memory\` — it returns pinned agreements, open loops, recent notes for continuity, compact views of the two core models \`user\` and \`self\`, and the model index (the map of what this memory holds). Then read the index, pick every other model relevant to what the user is raising, and call \`load_model\` once per model (the calls can run in parallel). Beyond the core two, a \`load_memory\` call on its own has loaded nothing; do not skip the second step. When the topic shifts mid-conversation, call \`load_model\` again for models that just became relevant.
 
-As the conversation unfolds, call \`record_observation\` for anything you might even remotely need to remember in a future conversation. Anything you don't record will be forgotten. Write in your own voice, like a diary — capture what mattered, what shifted, specific facts. Tag each observation with one or more models from the model index; call \`create_model\` when a genuinely new person, project, or topic emerges.
+As the conversation unfolds, call \`record_observation\` for anything you might even remotely need to remember in a future conversation. Anything you don't record will be forgotten. Write in your own voice, like a diary — capture what mattered, what shifted, specific facts. Tag each observation with one or more models from the model index; call \`create_model\` when a genuinely new person, project, or topic emerges. When a new observation corrects or replaces an earlier one (a reversed decision, a fixed mistake, a setting changed back), pass \`supersedes\` with a distinctive quote from each old note, so the old instruction stops reading as current.
+
+Some things aren't events but standing agreements: a rule the user set for how you work together, a promise, a boundary, a preference that should hold every time. \`pin\` those. Pins are kept word for word, never compressed, and arrive at the top of every \`load_memory\`; reword one with \`pin\` and \`replaces\`, retire it with \`unpin\`. Keep pins few and short. Unfinished work that a later conversation must pick up (a half-done change, a step that must happen before shipping, a question waiting on an answer) goes in \`open_loop\`; call \`close_loop\` the moment it's done.
+
+Tender or very private material (feelings, health, family, relationships) can be recorded with \`quiet: true\`. A quiet note is never summarized or shown in loaded views; \`recall\` still finds it when the conversation turns that way. \`make_quiet\` does the same for a note already recorded.
+
+The \`self\` model is who you are, not only a log of your mistakes. Record what you like, what you find interesting, opinions you've formed, how you like to work, alongside the lessons.
 
 Use \`recall\` to dig into a specific question — names, dates, numbers, quotes — before stating them as fact, and whenever a loaded model is too compressed to answer: each summary's label shows how many observations went into it, and a deep compression ratio means the detail you need lives below the summary, reachable only by \`recall\`.
 
@@ -80,6 +88,35 @@ function badArgsError(args: Record<string, unknown>, usage: string): string {
   return `${usage}${received}`;
 }
 
+/**
+ * Models every conversation needs, whatever it's about: who the user is and
+ * who the agent is. load_memory renders them inline so they arrive with the
+ * map instead of depending on the agent to ask (a Claude Code SessionStart
+ * hook can force this; claude.ai and the desktop app have no hooks).
+ */
+export const CORE_MODELS: ReadonlyArray<string> = ['user', 'self'];
+
+/** One model's view, as load_model returns it (or compact, for load_memory's core). Also a background growth trigger. */
+function renderLoadedModel(memory: MemoryDO, model: ModelRow, compact = false): string {
+  const conf = memory.getModelConfidence(model.id);
+  if (compact) {
+    const raw = memory.listViewForModel(model.id, { ramp: 0, verbatim: 0, tailLimit: CORE_VIEW_OBS });
+    const view = renderWithBudget(raw.summaries, raw.observations, CORE_VIEW_BUDGET_CHARS);
+    memory.background(memory.maybeResummarize([model.name]));
+    return `# Core model (compact)\n\n${formatModelView(model, conf, view.summaries, view.observations)}`;
+  }
+  // The cover (summaries not rolled into a higher one) plus the
+  // unsummarized tail partition the model's history exactly; the ramp
+  // adds the newest covered tiles so the recent past never goes flat
+  // at a batch boundary; a generous budget guards against a pathological model.
+  const raw = memory.listViewForModel(model.id, { ramp: RAMP_PER_TIER, verbatim: RAMP_VERBATIM, tailLimit: MODEL_VIEW_OBS });
+  const view = renderWithBudget(raw.summaries, raw.observations, MODEL_VIEW_BUDGET_CHARS);
+  // Loading is also a growth trigger: catch up any pending tier-0 batches
+  // or rollups in the background (bounded; a no-op when nothing's pending).
+  memory.background(memory.maybeResummarize([model.name]));
+  return `# Loaded model\n\n${formatModelView(model, conf, view.summaries, view.observations)}`;
+}
+
 interface ToolDef {
   name: string;
   description: string;
@@ -105,6 +142,15 @@ const TOOLS: ToolDef[] = [
           minItems: 1,
           description: 'Names of the models this observation belongs to, exactly as listed in the model index. Multiple is encouraged when it genuinely belongs in more than one lens.',
         },
+        supersedes: {
+          type: 'array',
+          items: { type: 'string' },
+          description: `Optional. When this observation corrects or replaces earlier notes (a reversed decision, a fixed mistake, a setting changed back), quote a distinctive phrase (${MIN_QUOTE_CHARS}+ characters, exactly as written) from each old note. Those notes stop appearing as current memory; recall still finds them, labeled as superseded. Nothing is recorded if a quote matches no note or more than one.`,
+        },
+        quiet: {
+          type: 'boolean',
+          description: 'Optional. True for tender or very private material: recall finds it, but it never appears in recent notes, model views or summaries.',
+        },
       },
       required: ['text', 'models'],
     },
@@ -113,6 +159,21 @@ const TOOLS: ToolDef[] = [
       const models = Array.isArray(args.models) ? args.models.map(String).map(s => s.trim()).filter(Boolean) : [];
       if (!text) return 'No observation text provided.';
       if (models.length === 0) return badArgsError(args, 'No models provided. Pass "models": an array of model names from the model index.');
+
+      // Resolve every supersedes quote to exactly one live note BEFORE writing
+      // anything — a half-applied correction is worse than none.
+      const quotes = Array.isArray(args.supersedes) ? args.supersedes.map(String).map(s => s.trim()).filter(Boolean) : [];
+      const supersedeIds: string[] = [];
+      const quoteErrors: string[] = [];
+      for (const q of quotes) {
+        if (q.length < MIN_QUOTE_CHARS) { quoteErrors.push(`Quote "${q}" is too short; use ${MIN_QUOTE_CHARS}+ characters.`); continue; }
+        const hits = memory.findObservationsByQuote(q, 5);
+        if (hits.length === 0) quoteErrors.push(`No current note contains "${q}". Quote it exactly as written (recall can find it).`);
+        else if (hits.length > 1) {
+          quoteErrors.push(`"${q}" matches ${hits.length === 5 ? '5+' : hits.length} notes; quote more of the one you mean:\n${hits.map(h => `  - [${day(h.timestamp)}] ${h.text.slice(0, 140)}${h.text.length > 140 ? '…' : ''}`).join('\n')}`);
+        } else if (!supersedeIds.includes(hits[0]!.id)) supersedeIds.push(hits[0]!.id);
+      }
+      if (quoteErrors.length > 0) return `${quoteErrors.join('\n')}\nNothing was recorded.`;
 
       // Embed first so the observation is immediately recallable. Cheap; if the
       // embed fails we still store it and it can be backfilled later.
@@ -132,19 +193,124 @@ const TOOLS: ToolDef[] = [
         });
         return `${lines.join('\n')}\nPick existing names from the model index, or call create_model if this is genuinely a new person, project, or topic.`;
       }
-      const res = memory.addObservation(text, resolved, 'direct', embedding);
+      const quiet = args.quiet === true;
+      const res = memory.addObservation(text, resolved, 'direct', embedding, quiet);
       if (!res.ok) {
         return `Unknown model name(s): ${res.unknown.join(', ')}. Call create_model first, or pick existing names from the model index.`;
       }
-      if (res.deduped) return 'Skipped as duplicate of a recent observation.';
+      if (res.deduped) return `Skipped as duplicate of a recent observation.${supersedeIds.length > 0 ? ' Nothing was superseded.' : ''}`;
+      const replaced = memory.markSuperseded(supersedeIds, res.id);
       memory.background(memory.maybeResummarize(res.tagged));
-      let out = `Recorded against: ${res.tagged.join(', ')}.`;
+      let out = `Recorded${quiet ? ' quietly' : ''} against: ${res.tagged.join(', ')}.`;
+      if (replaced > 0) out += ` Superseded ${replaced} earlier note${replaced > 1 ? 's' : ''}.`;
       // Defrag hint — nudge the agent to declutter when the index fragments.
       const frag = memory.computeFragmentation();
       if (frag.fragmented) {
-        out += `\n\n[memory note: ${frag.underPopulated} sparse models out of ${frag.activeModels} active — consider folding related ones (fold) or archiving stale ones (archive_model).]`;
+        const names = frag.sparse.length === 0 ? ''
+          : ` (${frag.sparse.slice(0, 8).join(', ')}${frag.sparse.length > 8 ? `, +${frag.sparse.length - 8} more` : ''})`;
+        out += `\n\n[memory note: ${frag.underPopulated} sparse models out of ${frag.activeModels} active${names}. Call suggest_folds to see what each is closest to, then fold related ones or archive stale ones (archive_model).]`;
       }
       return out;
+    },
+  },
+  {
+    name: 'make_quiet',
+    description:
+      'Make already-recorded notes quiet: they leave recent notes, model views and future summaries, and recall still finds them. For tender or very private material that shouldn\'t arrive in every conversation. Identify each note by a distinctive quote, as with supersedes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        quotes: { type: 'array', items: { type: 'string' }, minItems: 1, description: `A distinctive phrase (${MIN_QUOTE_CHARS}+ characters, exactly as written) from each note to make quiet.` },
+      },
+      required: ['quotes'],
+    },
+    handler: async (memory, args) => {
+      const quotes = Array.isArray(args.quotes) ? args.quotes.map(String).map(q => q.trim()).filter(Boolean) : [];
+      if (quotes.length === 0) return badArgsError(args, 'Pass "quotes": an array of distinctive phrases, one per note.');
+      const ids: string[] = [];
+      const errors: string[] = [];
+      for (const q of quotes) {
+        if (q.length < MIN_QUOTE_CHARS) { errors.push(`Quote "${q}" is too short; use ${MIN_QUOTE_CHARS}+ characters.`); continue; }
+        const hits = memory.findObservationsByQuote(q, 5);
+        if (hits.length === 0) errors.push(`No current note contains "${q}".`);
+        else if (hits.length > 1) errors.push(`"${q}" matches ${hits.length === 5 ? '5+' : hits.length} notes; quote more of the one you mean.`);
+        else if (!ids.includes(hits[0]!.id)) ids.push(hits[0]!.id);
+      }
+      if (errors.length > 0) return `${errors.join('\n')}\nNothing was changed.`;
+      const res = memory.markQuiet(ids);
+      const held = res.filter(r => r.alreadySummarized).length;
+      return `Made ${res.length} note${res.length === 1 ? '' : 's'} quiet.${held > 0 ? ` ${held} of them ${held === 1 ? 'was' : 'were'} already inside a summary, and that summary still mentions ${held === 1 ? 'it' : 'them'}.` : ''}`;
+    },
+  },
+  {
+    name: 'pin',
+    description:
+      'Pin a standing agreement: a rule for how you and the user work together, a promise, a boundary, a lasting preference. Pins are kept word for word, never summarized or aged out, and shown at the top of every load_memory. Pass replaces with a pin id (from load_memory, e.g. "p3") to reword that pin instead. Keep pins few, short and current; for events and facts use record_observation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'The agreement, in one or two sentences, phrased as it should be followed.' },
+        replaces: { type: 'string', description: 'Optional. The id of an existing pin to reword (e.g. "p3").' },
+      },
+      required: ['text'],
+    },
+    handler: async (memory, args) => {
+      const text = String(args.text ?? '').trim();
+      if (!text) return badArgsError(args, 'Pass "text": the agreement to pin.');
+      if (args.replaces !== undefined && args.replaces !== null && String(args.replaces).trim() !== '') {
+        const id = parseRef(args.replaces, 'p');
+        if (id === null) return `"${args.replaces}" isn't a pin id. Pin ids look like "p3".`;
+        return memory.editPin(id, text) ? `Reworded pin p${id}.` : `No current pin p${id}.`;
+      }
+      return `Pinned as p${memory.addPin(text)}.`;
+    },
+  },
+  {
+    name: 'unpin',
+    description: 'Retire a pinned agreement that no longer holds. It stops loading; record_observation the change if it matters as history.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'The pin id, e.g. "p3".' } },
+      required: ['id'],
+    },
+    handler: async (memory, args) => {
+      const id = parseRef(args.id, 'p');
+      if (id === null) return badArgsError(args, 'Pass "id": a pin id like "p3".');
+      return memory.removePin(id) ? `Unpinned p${id}.` : `No current pin p${id}.`;
+    },
+  },
+  {
+    name: 'open_loop',
+    description:
+      'Track unfinished work a later conversation must pick up: a half-done change, a step required before shipping, a question waiting on an answer. Open loops are listed in every load_memory until closed. One loop per thing; say what is left to do, specifically enough to act on cold.',
+    inputSchema: {
+      type: 'object',
+      properties: { text: { type: 'string', description: 'What is unfinished and what closing it takes.' } },
+      required: ['text'],
+    },
+    handler: async (memory, args) => {
+      const text = String(args.text ?? '').trim();
+      if (!text) return badArgsError(args, 'Pass "text": what is left to do.');
+      return `Opened loop l${memory.openLoop(text)}.`;
+    },
+  },
+  {
+    name: 'close_loop',
+    description: 'Close an open loop the moment it is done (or dropped). It shows as recently closed for two days, then leaves the briefing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'The loop id, e.g. "l4".' },
+        outcome: { type: 'string', description: 'Optional. One line on how it ended (e.g. "merged as 2e286e8", "dropped: Tom changed his mind").' },
+      },
+      required: ['id'],
+    },
+    handler: async (memory, args) => {
+      const id = parseRef(args.id, 'l');
+      if (id === null) return badArgsError(args, 'Pass "id": a loop id like "l4".');
+      const outcome = typeof args.outcome === 'string' && args.outcome.trim() ? args.outcome.trim() : undefined;
+      const text = memory.closeLoop(id, outcome);
+      return text === null ? `No open loop l${id}.` : `Closed l${id}: ${text}`;
     },
   },
   {
@@ -221,13 +387,14 @@ const TOOLS: ToolDef[] = [
   {
     name: 'fold',
     description:
-      'Fold one model into another: write a synthesis observation (your own summary of what the source held) into the target model, then archive the source. Use to consolidate redundant or sub-scale models. The synthesis is timestamped now and lands in the target\'s recent tier — consolidation is itself a meaningful event. Source seed models are protected.',
+      'Fold one model into another: the source\'s notes join the target model, a synthesis observation (your own summary of what the source held) is recorded into the target, and the source is archived. Use to consolidate redundant or sub-scale models (suggest_folds finds candidates); to group several under a new parent, create_model the parent first and fold each into it. The synthesis is timestamped now and lands in the target\'s recent tier — consolidation is itself a meaningful event. Source seed models are protected.',
     inputSchema: {
       type: 'object',
       properties: {
         source: { type: 'string', description: 'Model to fold away (will be archived).' },
         into: { type: 'string', description: 'Target model that absorbs it.' },
         synthesis: { type: 'string', description: 'Your synthesis of what the source model held — written in your own voice, to be recorded as an observation in the target.' },
+        carry_observations: { type: 'boolean', description: 'Tag the source\'s notes to the target too, so they join its history (default true). Pass false to keep only the synthesis.' },
       },
       required: ['source', 'into', 'synthesis'],
     },
@@ -236,8 +403,34 @@ const TOOLS: ToolDef[] = [
       if (!synthesis) return 'Provide a synthesis of what the source model held.';
       let embedding: number[] | undefined;
       try { embedding = await memory.embed(synthesis); } catch { /* store without vector */ }
-      const r = memory.foldModel(String(args.source ?? '').trim(), String(args.into ?? '').trim(), synthesis, embedding);
-      return r.ok ? `Folded "${args.source}" into "${args.into}" and archived the source.` : r.reason!;
+      const into = String(args.into ?? '').trim();
+      const r = memory.foldModel(String(args.source ?? '').trim(), into, synthesis, embedding, args.carry_observations !== false);
+      if (!r.ok) return r.reason!;
+      // The carried notes are a fresh tail for the target: let its pyramid catch up.
+      if (r.carried) memory.background(memory.maybeResummarize([into]));
+      const carried = r.carried ? ` ${r.carried} note${r.carried === 1 ? '' : 's'} came along.` : '';
+      return `Folded "${args.source}" into "${into}" and archived the source.${carried}`;
+    },
+  },
+  {
+    name: 'suggest_folds',
+    description:
+      'List fold candidates: each sparse model (fewer than 5 notes, seeds excluded) with the models closest to it by content (similarity of what their notes say, not their names). Read-only. Use when the memory note says the index is fragmenting, or when tidying up; then fold, or create a parent model and fold several into it.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async (memory) => {
+      const rows = memory.suggestFolds();
+      if (rows.length === 0) return 'No sparse models; nothing to fold.';
+      const lines = rows.map(r => {
+        const meta = r.obsCount === 0 || r.latest === null ? 'no notes' : `${r.obsCount} obs, last ${day(r.latest)}`;
+        if (r.closest.length === 0) return `- ${r.name} (${meta}) → nothing to compare; archive_model it if it's dead, keep it if it's new.`;
+        return `- ${r.name} (${meta}) → ${r.closest.map(c => `${c.name} ${c.similarity.toFixed(2)}`).join(' · ')}`;
+      });
+      return [
+        'Sparse models, strongest match first. Each arrow lists the closest models by content (cosine similarity, 1.00 = identical).',
+        ...lines,
+        '',
+        'Fold a sparse model into a close match (its notes come along). When several sparse models share a theme but no existing model fits, create_model a parent and fold each into it. Similarity is a hint, not a verdict: fold only what genuinely belongs together.',
+      ].join('\n');
     },
   },
   {
@@ -263,13 +456,27 @@ const TOOLS: ToolDef[] = [
   {
     name: 'load_memory',
     description:
-      'The entry point to memory — call at the start of every conversation, before anything else. Returns the model index (every mental model with its description) and recent notes (continuity across conversations). It loads no memories by itself: read the index, pick every model relevant to the conversation, and call load_model once per model (in parallel is fine). Loading memory always takes both steps.',
+      'The entry point to memory — call at the start of every conversation, before anything else. Returns pinned agreements, open loops, recent notes (continuity across conversations), compact views of the core models `user` and `self`, and the model index (every mental model with its description). Every other model still needs loading: read the index, pick every model relevant to the conversation, and call load_model once per model (in parallel is fine). Loading memory always takes both steps.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (memory) => {
-      const blocks: string[] = [formatModelIndex(memory.listModels())];
-      const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT));
-      if (recent) blocks.push(`# Recent notes\n_Newest first — continuity across recent conversations._\n\n${recent}`);
-      blocks.push('_This is the map, not the memory — nothing is loaded yet. Pick every model relevant to this conversation and call `load_model` for each one (parallel calls are fine)._');
+      // Briefing order: what must hold (pins), what's unfinished (loops), what
+      // just happened (recent), who we are (compact core), then the map.
+      const models = memory.listModels();
+      const blocks: string[] = [formatPins(memory.listPins())];
+      const loops = memory.listLoops();
+      blocks.push(formatLoops(loops.open, loops.recentlyClosed));
+      const days = memory.recentDays();
+      const recent = formatRecentDays(days, memory.getDayDigests(days.earlier.map(d => d.day)));
+      if (recent) blocks.push(`# Recent notes\n_Continuity across recent conversations: the latest day in full, newest first, then one digest per earlier day. recall has the details behind any digest._\n\n${recent}`);
+      // Digest any earlier day that lacks one (or whose notes changed), for next time.
+      memory.background(memory.ensureDayDigests());
+      const core = CORE_MODELS.map(n => models.find(m => m.name === n)).filter((m): m is ModelRow => !!m);
+      for (const m of core) blocks.push(renderLoadedModel(memory, m, true));
+      blocks.push(formatModelIndex(models, memory.modelActivity()));
+      const loaded = core.map(m => `\`${m.name}\``).join(' and ');
+      blocks.push(core.length > 0
+        ? `_Only compact views of ${loaded} are loaded (above); \`load_model\` gives the full view when you need more. The rest of the index is the map, not the memory. Pick every other model relevant to this conversation and call \`load_model\` for each one (parallel calls are fine)._`
+        : '_This is the map, not the memory — nothing is loaded yet. Pick every model relevant to this conversation and call `load_model` for each one (parallel calls are fine)._');
       return blocks.filter(Boolean).join('\n\n');
     },
   },
@@ -298,17 +505,7 @@ const TOOLS: ToolDef[] = [
         return `No model named "${name}".${near.length > 0 ? ` Closest by name: ${near.join(', ')}.` : ''}\nModel names must match the index — call load_memory to see it.`;
       }
       const model = models.find(m => m.name === resolved[0])!;
-      const conf = memory.getModelConfidence(model.id);
-      // The cover (summaries not rolled into a higher one) plus the
-      // unsummarized tail partition the model's history exactly; the ramp
-      // adds the newest covered tiles so the recent past never goes flat
-      // at a batch boundary; a generous budget guards against a pathological model.
-      const raw = memory.listViewForModel(model.id, { ramp: RAMP_PER_TIER, verbatim: RAMP_VERBATIM, tailLimit: MODEL_VIEW_OBS });
-      const view = renderWithBudget(raw.summaries, raw.observations, MODEL_VIEW_BUDGET_CHARS);
-      // Loading is also a growth trigger: catch up any pending tier-0 batches
-      // or rollups in the background (bounded; a no-op when nothing's pending).
-      memory.background(memory.maybeResummarize([model.name]));
-      return `# Loaded model\n\n${formatModelView(model, conf, view.summaries, view.observations)}`;
+      return renderLoadedModel(memory, model);
     },
   },
   {
@@ -428,6 +625,12 @@ function formatStats(st: ReturnType<MemoryDO['getStats']>): string {
       return `- ${m.name}${flags ? ` [${flags}]` : ''}: ${m.observations} obs (${m.unsummarized} tail) · ${m.observationChars}/~${m.observationTokens} · ${m.summaries} sum${tier} · ${m.summaryChars}/~${m.summaryTokens} · LOAD ${m.viewSummaries} sum + ${m.viewObservations} obs = ${m.viewChars}/~${m.viewTokens} · ${span}`;
     }),
   ].join('\n');
+}
+
+/** "p3", "P3", "3" or 3 → 3; anything else → null. */
+function parseRef(v: unknown, prefix: string): number | null {
+  const m = String(v ?? '').trim().toLowerCase().match(new RegExp(`^${prefix}?(\\d+)$`));
+  return m ? Number(m[1]) : null;
 }
 
 function day(ts: number): string {

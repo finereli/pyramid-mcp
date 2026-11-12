@@ -30,14 +30,23 @@ The same primitives as Glopus memory, minus the parts that required owning the c
 
 ```
 models            id, name, description, is_seed, archived, created_at, last_summarized_count (unused, kept)
-observations      id, text, timestamp, source, embedding
+observations      id, text, timestamp, source, embedding, quiet
 observation_tags  observation_id, model_id
 summaries         id, model_id, tier, text, start_timestamp, end_timestamp, source_count, is_dirty (unused), embedding
 summary_sources   summary_id, source_type ('observation' | 'summary'), source_id
 config            key, value
+supersessions     old_id, new_id, timestamp
+day_digests       day, text, source_count, created_at
+pins              id, text, created_at, updated_at, removed_at
+loops             id, text, opened_at, closed_at, outcome
 ```
 
 - An **observation** is a short agent-authored note, tagged to one or more models. Observations are never edited or deleted by the system.[^dirty]
+- A **supersession** says a later observation corrects an earlier one (`record_observation(..., supersedes: [quote])`). Neither observation changes; the row only changes how the old one is *presented*. It drops out of everything that reads as current memory (recent notes, a model view's verbatim tail and ramp), goes into its tier-0 batch marked `(SUPERSEDED: ...)` so the summary keeps it only as history, and stays in `recall` ranked down by 0.1 and labeled with when and by what it was replaced. The agent points at the old note with a quote, not an id (ids are never shown): the quote must match exactly one live note case-insensitively, or nothing is recorded. Summaries already written from the old note are immutable and stay as they are; the correction reaches the view as a newer note. Without this, a day of back-and-forth (four notes about a layout, each reversing the last) left every stale instruction alive and equally weighted.
+- The view also marks the trace: wherever a correcting note is shown (recent notes, a model view's tail), it ends with `[corrects <date>: "<first sentence of the old note>"]` (the last two, `+N more` beyond). Hiding the old note keeps it from reading as current; the trace keeps a flip-flop visible instead of letting it vanish.
+- A **quiet** observation (`record_observation(..., quiet: true)` or `make_quiet([quote])` afterwards) is for tender or very private material. It is stored, tagged and embedded like any other, but it is never batched into a summary and never shown in recent notes, day digests or model views; `recall` finds it, labeled `quiet`. A note quieted after a summary already used it stays in that summary (summaries are immutable), and `make_quiet` says so. Without this, a model's top summary carried its most personal material into every conversation, a config fix included.
+- A **pin** is a standing agreement (a rule for how the agent and the user work together, a promise, a boundary, a lasting preference): kept word for word, never summarized, never aged out, always first in `load_memory`. Pins are rows, not observations, because the pyramid's job is to compress, and compression turns a rule into an event ("prefers calm visuals"). Reworded in place; unpinning sets `removed_at`.
+- An **open loop** is unfinished work a later conversation must pick up, listed in `load_memory` until `close_loop`, then shown as recently closed for two days.
 - A **model** is a mental model - a person, project, topic, or facet. Five seed models (`self`, `user`, `system`, `world`, `memory`) are protected from archive and rename.
 - A **summary** is one node of a model's pyramid. `tier` is **depth**: 0 = built from observations, 1 = built from tier-0 summaries, and so on.[^tiername] `summary_sources` records exactly which observations (tier 0) or summaries (tier N+1) it was built from. A summary without sources is invalid and is deleted on DO start.[^legacy]
 
@@ -76,7 +85,7 @@ Derived sets, all per model and all by provenance:
 
 ### 5.3 Prompts
 
-Two prompts (`pyramid.ts`), both lens-aware, both stating the target length, both asking for date ranges on arcs and dates on events, both forbidding preamble and generic closers, both with factual discipline (never invent a number, name, or date).
+Two prompts (`pyramid.ts`), both in the agent's own first-person diary voice (the agent reads them as its own past, so "I", everyone by name, and never the third-person report frame "Between X and Y, Tom navigated..."), both asking to keep what things meant beside what happened (never inventing feelings nobody recorded), both lens-aware, both stating the target length, both asking for date ranges on arcs and dates on events, both forbidding preamble and generic closers, both with factual discipline (never invent a number, name, or date).
 
 - **Tier 0:** compress these observations through this lens; the raw observations are preserved and searchable; every word must earn its place; keep the specifics that make a memory verifiable later; trace the arc with causal connective tissue.
 - **Rollup:** compress these summaries already written through this lens; merge patterns across periods, consolidate repeats, keep what is distinct and load-bearing.
@@ -96,7 +105,10 @@ Two prompts (`pyramid.ts`), both lens-aware, both stating the target length, bot
 | `RAMP_PER_TIER` | 2 newest covered summaries per tier below the top | mcp.ts |
 | `RAMP_VERBATIM` | 5 newest observations always verbatim | mcp.ts |
 | minimum accepted summary | 40 chars | memory-do.ts |
-| recent notes cap | 6,000 chars | format.ts |
+| recent notes cap (latest day) | 6,000 chars | format.ts |
+| earlier days shown / window | 6 / 14 days | memory-do.ts |
+| day digest target | 450 chars | pyramid.ts |
+| digests written per `load_memory` | 2 | memory-do.ts |
 | recall limit | 15 | mcp.ts |
 
 ## 6. Reading
@@ -105,12 +117,16 @@ Two prompts (`pyramid.ts`), both lens-aware, both stating the target length, bot
 
 Loading is a deliberate two-step protocol, and the agent **is** the router: it has the user message in its own context, so relevance inference stays with it, not with the memory.[^receipts]
 
-**`load_memory` (no arguments)** returns the map, never the memories:
+**`load_memory` (no arguments)** returns a briefing, in this order: what must hold, what's unfinished, what just happened, who we are, then the map. It is deliberately light: the full `user` + `self` views on a real store ran to a wall of text before the agent said a word, and a bloated context makes the agent worse, not better.
 
-1. **Model index** - every active model with its description.
-2. **Recent notes** - the newest observations across all models, verbatim, newest first, capped by characters, whether or not a pyramid has covered them. The cross-conversation continuity substitute.[^stream][^recent]
+1. **Pinned** - every live pin, verbatim, with its id (`[p3]`). Omitted when there are none.
+2. **Open loops** - open loops oldest first (`[l4 · since 2026-11-10]`), then loops closed in the last two days with their outcome. Omitted when there are none.
+3. **Recent notes** - the cross-conversation continuity substitute,[^stream][^recent] in two parts. The **latest active day** (UTC) in full: every live (not superseded) observation, newest first, whether or not a pyramid has covered it, capped at 6,000 chars with a count of what the cap held back. Then **up to 6 earlier active days** from the last 14, one line each: a ~450-char **day digest** (Workers AI, one call per day, written in the background by `load_memory`, at most 2 per call), or, until the digest exists, the first sentences of the day's newest three notes. A digest stores the day's live note count and is rewritten when that count changes (a late note, a supersession), so unlike pyramid summaries it is a view cache, not part of the record. The old block (the newest 30 notes, flat) let one busy day push the whole week out: on a 25-note day the agent started the next conversation knowing nothing about the day before.
 
-The response ends by saying so in-band: nothing is loaded yet - pick the relevant models and call `load_model`. That visible incompleteness is the mechanism: an index alone is a menu, and a menu demands a pick.
+4. **Core models, compact** - `user` and `self` (`CORE_MODELS` in mcp.ts): the cover and the newest 3 tail notes within 4,000 chars, no ramp. Every conversation needs those two, whatever it's about, so the server includes them (claude.ai and the desktop app have no hooks to force a load); `load_model` gives the full view when the conversation calls for it.
+5. **Model index** - every active model with its description cut to 140 chars at a word boundary (enough to route on), its note count and the date of its newest note (`[12 obs · last 2026-07-14, 4mo ago]`, or `[no notes yet]`). Descriptions are written once and drift; the date makes a stale one ("active", last note four months ago) visible without loading the model.
+
+The response ends by saying so in-band: only compact core views are loaded - pick the other relevant models and call `load_model`. That visible incompleteness is the mechanism: an index alone is a menu, and a menu demands a pick.
 
 **`load_model(name)`** loads the full view of one named model — one call per model, matching the singular shape agents reach for (the sibling admin tools all take `name`; the earlier `models[]` array invited `{"name": ...}` calls that fell through to an unhelpful error). Agents load several models with parallel calls. The name is matched case-insensitively against the index; an unknown name returns an error with near-matches, never a silent fallback. The view: header and confidence meta (`[name · N obs · spans · latest]`), then the summaries oldest first, each labeled `[tier T · N obs · in→out chars · start–end]` — the observation count and char totals are **transitive** (raw observations behind the summary through all tiers, computed at insert from the sources' own stats, backfilled tier-ascending on DO start), so the label shows the compression ratio at a glance; direct source counts are useless above tier 0 (always the fan-in). Deeper compression tells the agent to verify specifics with `recall`, whose summary labels carry the same obs count. Then recent observations verbatim oldest first. What is shown is the **cover plus a resolution ramp**: the cover (summaries nothing has rolled up) partitions the history exactly, and on top of it the view adds the newest `RAMP_PER_TIER` (2) summaries at every tier below the top even though a higher tile already covers them, and always the newest `RAMP_VERBATIM` (5) observations raw even when a tier-0 covers them. Ramp rows are labeled ("finer view of a period summarized above", "also summarized above") so the overlap is explicit. Reading this oldest-first gives old arcs at high tiers and progressively finer recent material - a resolution gradient that does not depend on where the observation count happens to fall.[^ramp] A generous per-model render budget (16K chars) guards against a pathological model with fill-down priority: top tier always, then newest lower summaries, then newest observations; whatever it cuts is still in the store.
 
@@ -128,10 +144,11 @@ A bottom-up pyramid cannot know at tier-0 time which detail will matter later. H
 
 ## 7. Tool surface (MCP)
 
-- `record_observation(text, models[])` - multi-tag, agent-authored, prefix-dedup within 24h. Rejects unknown model names. Triggers background pyramid growth; returns a **defrag hint** when the model index fragments (too many sparse models).
-- `create_model(name, description)` - upsert by name. `update_model_description`, `rename_model`, `archive_model` - maintenance; seeds protected. `fold(source, into, synthesis)` - record a synthesis observation into the target, archive the source.
+- `record_observation(text, models[], supersedes?[], quiet?)` - multi-tag, agent-authored, prefix-dedup within 24h; `supersedes` quotes earlier notes this one corrects (§4); `quiet` keeps it out of everything loaded (§4). `make_quiet(quotes[])` quiets notes already recorded.
+- `pin(text, replaces?)`, `unpin(id)` - standing agreements (§4); ids look like `p3`. `open_loop(text)`, `close_loop(id, outcome?)` - unfinished work (§4); ids look like `l4`. Rejects unknown model names. Triggers background pyramid growth; returns a **defrag hint** when the model index fragments (too many sparse models), naming up to 8 of them and pointing at `suggest_folds`.
+- `create_model(name, description)` - upsert by name. `update_model_description`, `rename_model`, `archive_model` - maintenance; seeds protected. `fold(source, into, synthesis, carry_observations?)` - tag the source's observations to the target too (default; they join its pyramid as a fresh tail, so folded detail stays in a model that gets loaded instead of on an archived one nothing loads), record a synthesis observation into the target, archive the source. `suggest_folds()` - read-only: each sparse model (non-seed, under 5 notes) with its two closest active models by content, the cosine similarity of mean observation embeddings ("kali" and "hobbies" share no name token but are plainly one lens). The agent decides; this only ranks. A parent model is the agent's move: `create_model` it, then fold each sparse sibling in.
 - `recall(query)` - §6.2.
-- `load_memory()` - §6.1; the map: model index + recent notes, no arguments.
+- `load_memory()` - §6.1; the briefing: pins, open loops, recent notes, compact core models, model index. No arguments.
 - `load_model(name)` - §6.1; one model's view; also triggers background growth for the loaded model.
 - `memory_stats()` - counts, size distributions (chars and ~tokens), per-model rows including the unsummarized tail, top tier, and LOAD: what `load_model` would render for the model (cover + ramp + tail), measured on the real view.
 

@@ -50,8 +50,8 @@ picks from it — loads the memories. The server's MCP `instructions` teach this
 instruction - the model can forget or skip it.
 
 Claude Code hooks make the start guaranteed. A `SessionStart` hook calls
-`load_memory` and then `load_model` with the always-useful seed models
-automatically before the first turn, using the `mcp_tool` hook type to invoke
+`load_memory` (which already includes the core `user` and `self` models) and
+then `load_model` for `memory` automatically before the first turn, using the `mcp_tool` hook type to invoke
 Pyramid directly - no model cooperation needed.
 
 Add this to `~/.claude/settings.json`:
@@ -73,20 +73,6 @@ Add this to `~/.claude/settings.json`:
             "type": "mcp_tool",
             "server": "pyramid",
             "tool": "load_model",
-            "input": { "name": "user" },
-            "statusMessage": "Loading user model..."
-          },
-          {
-            "type": "mcp_tool",
-            "server": "pyramid",
-            "tool": "load_model",
-            "input": { "name": "self" },
-            "statusMessage": "Loading self model..."
-          },
-          {
-            "type": "mcp_tool",
-            "server": "pyramid",
-            "tool": "load_model",
             "input": { "name": "memory" },
             "statusMessage": "Loading memory model..."
           }
@@ -103,9 +89,10 @@ The `server` name must match your MCP server name (whatever you passed to
 `"claude.ai Pyramid"`.
 
 **Models:** Pyramid ships with five seed models - `user`, `self`, `system`,
-`world`, and `memory`. The three in the hook above are the most useful on every
-conversation: `user` loads context about the person you serve, `self` loads the
-agent's own identity and voice, and `memory` loads how the memory system works.
+`world`, and `memory`. Three are useful on every
+conversation: `user` (the person you serve) and `self` (the agent's own identity
+and voice) come with every `load_memory` call, and the hook adds `memory` (how
+the memory system works).
 The model sees the full model index from `load_memory` and calls `load_model`
 for more (project-specific models, people, etc.) once it knows what the
 conversation is about.
@@ -120,7 +107,7 @@ Then add to your `CLAUDE.md`:
 # Memory
 
 Use Pyramid MCP exclusively for long-term memory. A SessionStart hook
-auto-loads the model index plus the user, self, and memory models. On
+auto-loads the model index, the user and self models, and the memory model. On
 your first turn, check the index and call load_model for each model
 relevant to this conversation (parallel calls are fine). Record
 observations as you go - don't
