@@ -1,7 +1,7 @@
 import { SELF, env } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 import { buildTier0Job, SUPERSEDED_MARK } from '../src/pyramid.js';
-import { formatRecall } from '../src/format.js';
+import { formatRecall, formatRecentNotes } from '../src/format.js';
 import type { ModelRow, ObservationRow } from '../src/memory-do.js';
 
 function freshUser() {
@@ -69,6 +69,26 @@ describe('supersession — recall label', () => {
   });
 });
 
+describe('supersession — correction stub', () => {
+  it('shows what a correction replaced, in both recent notes and the model view', async () => {
+    const u = freshUser();
+    const old = await u.addObservation('Wallpaper is the animated aurora. It loops every 20s.', ['user']);
+    const fix = await u.addObservation('Wallpaper back to a still image', ['user']);
+    if (!old.ok || !fix.ok) throw new Error('setup');
+    await u.markSuperseded([old.id], fix.id);
+    const days = await u.recentDays();
+    expect(days.latest.map(o => o.id)).toEqual([fix.id]);
+    expect(formatRecentNotes(days.latest)).toMatch(/still image \[corrects \d{4}-\d{2}-\d{2}: "Wallpaper is the animated aurora\."\]$/);
+    const user = await u.getModel('user');
+    const view = await u.listViewForModel(user!.id);
+    expect(view.observations[0]!.corrects?.map(c => c.text)).toEqual(['Wallpaper is the animated aurora. It loops every 20s.']);
+  });
+
+  it('says nothing on a note that corrects nothing', () => {
+    expect(formatRecentNotes([{ id: 'a', text: 'plain', timestamp: Date.UTC(2026, 10, 12), source: 'direct' }])).toBe('- [2026-11-12] plain');
+  });
+});
+
 describe('supersession — record_observation', () => {
   it('records a correction and supersedes the quoted note', async () => {
     const u = 'sup-mcp-' + crypto.randomUUID();
@@ -83,7 +103,9 @@ describe('supersession — record_observation', () => {
     const lm = await call(u, 'load_memory', {});
     const recent = lm.slice(lm.indexOf('# Recent notes'), lm.indexOf('# Loaded model'));
     expect(recent).toContain('left at the default');
-    expect(recent).not.toContain('set to 1.5');
+    // The old note is gone as a line of its own; it survives only as the correction's stub.
+    expect(recent).not.toMatch(/^- \[[^\]]*\] Tom wants split_width_multiplier/m);
+    expect(recent).toMatch(/removed split_width_multiplier \[corrects \d{4}-\d{2}-\d{2}: "Tom wants split_width_multiplier set to 1\.5"\]/);
   });
 
   it('records nothing when a quote is ambiguous, missing, or too short', async () => {

@@ -70,12 +70,24 @@ function recentNoteLines(obs: ObservationRow[], capChars: number): string[] {
   const lines: string[] = [];
   let used = 0;
   for (const o of obs) {
-    const line = `- [${isoDate(o.timestamp)}] ${o.text}`;
+    const line = `- [${isoDate(o.timestamp)}] ${o.text}${correctionNote(o)}`;
     if (used + line.length > capChars && lines.length > 0) break;
     lines.push(line);
     used += line.length + 1;
   }
   return lines;
+}
+
+/**
+ * The one-line trace a correction carries of what it replaced, e.g.
+ * ` [corrects 2026-11-10: "Tiling stays on for every workspace."]`. The old
+ * note stays hidden as current memory; this keeps a flip-flop visible.
+ */
+export function correctionNote(o: ObservationRow): string {
+  if (!o.corrects || o.corrects.length === 0) return '';
+  const shown = o.corrects.slice(-2).map(c => `${isoDate(c.timestamp)}: "${firstSentence(c.text, 90)}"`);
+  const more = o.corrects.length > 2 ? ` +${o.corrects.length - 2} more` : '';
+  return ` [corrects ${shown.join('; ')}${more}]`;
 }
 
 /** A note's first sentence, cut to `max` chars — the fallback gist for a day with no digest yet. */
@@ -151,7 +163,7 @@ export function formatModelView(
   if (recentObs.length > 0) {
     const ordered = [...recentObs].sort((a, b) => a.timestamp - b.timestamp); // oldest→newest
     parts.push('\nRecent notes (verbatim):');
-    for (const o of ordered) parts.push(`- [${isoDate(o.timestamp)}${o.covered ? ' · also summarized above' : ''}] ${o.text}`);
+    for (const o of ordered) parts.push(`- [${isoDate(o.timestamp)}${o.covered ? ' · also summarized above' : ''}] ${o.text}${correctionNote(o)}`);
   }
   return parts.join('\n');
 }

@@ -55,6 +55,8 @@ export interface ObservationRow {
   source: string;
   /** Set on view rows only: this observation is already inside a tier-0 summary shown above (resolution ramp). */
   covered?: boolean;
+  /** Set on read-path rows only: the earlier notes this one superseded, oldest first, so a correction carries its history. */
+  corrects?: Array<{ timestamp: number; text: string }>;
 }
 
 export interface SummaryRow {
@@ -475,7 +477,7 @@ export class MemoryDO extends DurableObject<Env> {
     let n = 0;
     for (const old of oldIds) {
       if (old === newId) continue;
-      n += this.sql.exec('INSERT OR IGNORE INTO supersessions (old_id, new_id, timestamp) VALUES (?, ?, ?)', old, newId, Date.now()).rowsWritten;
+      n += this.sql.exec('INSERT OR IGNORE INTO supersessions (old_id, new_id, timestamp) VALUES (?, ?, ?) RETURNING old_id', old, newId, Date.now()).toArray().length; // rowsWritten would count index writes too
     }
     return n;
   }
@@ -486,6 +488,30 @@ export class MemoryDO extends DurableObject<Env> {
     const rows = this.sql.exec(`SELECT old_id FROM supersessions WHERE old_id IN (${placeholders(ids.length)})`, ...ids)
       .toArray() as Array<{ old_id: string }>;
     return new Set(rows.map(r => r.old_id));
+  }
+
+  /**
+   * Read path: attach to each row the notes it superseded (oldest first), so
+   * a correction shows what it replaced instead of the old note silently
+   * vanishing. Mutates and returns the rows.
+   */
+  attachCorrections<T extends ObservationRow>(rows: T[]): T[] {
+    if (rows.length === 0) return rows;
+    const found = this.sql.exec(
+      `SELECT sp.new_id, o.timestamp, o.text FROM supersessions sp JOIN observations o ON o.id = sp.old_id
+       WHERE sp.new_id IN (${placeholders(rows.length)}) ORDER BY o.timestamp ASC`,
+      ...rows.map(r => r.id),
+    ).toArray() as Array<{ new_id: string; timestamp: number; text: string }>;
+    const byNew = new Map<string, Array<{ timestamp: number; text: string }>>();
+    for (const f of found) {
+      if (!byNew.has(f.new_id)) byNew.set(f.new_id, []);
+      byNew.get(f.new_id)!.push({ timestamp: f.timestamp, text: f.text });
+    }
+    for (const r of rows) {
+      const c = byNew.get(r.id);
+      if (c) r.corrects = c;
+    }
+    return rows;
   }
 
   /** For recall labels: when each superseded id was replaced, and by what. */
@@ -667,7 +693,7 @@ export class MemoryDO extends DurableObject<Env> {
   listTailForModel(modelId: string, limit: number): ObservationRow[] {
     const unsummarized = this.unsummarizedObservations(modelId);
     const superseded = this.supersededAmong(unsummarized.map(o => o.id));
-    return unsummarized.filter(o => !superseded.has(o.id)).slice(-limit).reverse();
+    return this.attachCorrections(unsummarized.filter(o => !superseded.has(o.id)).slice(-limit).reverse());
   }
 
   /**
@@ -969,6 +995,7 @@ export class MemoryDO extends DurableObject<Env> {
        ORDER BY timestamp DESC, rowid DESC`,
       since,
     ).toArray() as Array<Record<string, unknown>>).map(toObservationRow);
+    this.attachCorrections(rows);
     const byDay = new Map<string, ObservationRow[]>();
     for (const o of rows) {
       const k = dayKey(o.timestamp);
@@ -1076,7 +1103,7 @@ export class MemoryDO extends DurableObject<Env> {
     if (!t) return { ok: false, reason: `No model named "${into}".` };
     if (s.id === t.id) return { ok: false, reason: 'A model cannot be folded into itself.' };
     const carried = carryObservations
-      ? this.sql.exec('INSERT OR IGNORE INTO observation_tags (observation_id, model_id) SELECT observation_id, ? FROM observation_tags WHERE model_id = ?', t.id, s.id).rowsWritten
+      ? this.sql.exec('INSERT OR IGNORE INTO observation_tags (observation_id, model_id) SELECT observation_id, ? FROM observation_tags WHERE model_id = ? RETURNING observation_id', t.id, s.id).toArray().length
       : 0;
     const id = crypto.randomUUID();
     const blob = embedding ? floatsToBlob(normalizeVec(embedding)) : null;

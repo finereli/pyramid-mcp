@@ -70,7 +70,7 @@ describe('maintenance ops', () => {
 
   it('suggest_folds ranks each sparse model\'s closest models by content', async () => {
     const u = freshUser();
-    for (const [name, desc] of [['dnd-maps', 'map app'], ['dnd-campaign', 'campaign'], ['geometry', 'math'], ['empty', 'nothing yet']]) await u.createModel(name, desc);
+    for (const [name, desc] of [['dnd-maps', 'map app'], ['dnd-campaign', 'campaign'], ['geometry', 'math'], ['empty', 'nothing yet']] as Array<[string, string]>) await u.createModel(name, desc);
     const dnd = [1, 0.1, 0, 0], dnd2 = [0.9, 0.2, 0, 0], math = [0, 0, 1, 0.1];
     await u.bulkLoad([], [
       { text: 'tokens on the tactical map', timestamp: Date.now() - 3000, models: ['dnd-maps'], embedding: dnd },
