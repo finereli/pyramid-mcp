@@ -426,6 +426,9 @@ describe('pyramid — verifier-driven coverage (guard, failure, multi-tier, adva
     expect(() => checkSynthOutput('')).toThrow();
     expect(() => checkSynthOutput('  ok. ')).toThrow();
     expect(checkSynthOutput('  ' + 'a real summary sentence with enough substance to count.' + '  ')).toBe('a real summary sentence with enough substance to count.');
+    expect(() => checkSynthOutput('The user wants a summary of these observations. Let me draft it around 600 characters.')).toThrow(/reasoning/);
+    expect(() => checkSynthOutput('Okay, so I need to write a tier-0 summary for the bizdev lens covering Oct 2 to Oct 11.')).toThrow(/reasoning/);
+    expect(checkSynthOutput('Between Oct 2 and Oct 11, Eli settled his serendipity search method and sent nine DMs.')).toMatch(/^Between/);
   });
 });
 

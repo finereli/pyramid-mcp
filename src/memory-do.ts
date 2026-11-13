@@ -13,7 +13,7 @@
  */
 import { DurableObject } from 'cloudflare:workers';
 import { handleMcpRequest } from './mcp.js';
-import { synthesize } from './synth.js';
+import { synthesize, looksLikeReasoning } from './synth.js';
 import { embed, embedOne, EMBEDDING_DIM } from './embeddings.js';
 import { batchTier0, batchRollup, buildTier0Job, buildRollupJob, stubSynthesize, type SynthJob } from './pyramid.js';
 
@@ -100,6 +100,7 @@ const MIN_SUMMARY_CHARS = 40;
 export function checkSynthOutput(text: string): string {
   const t = text.trim();
   if (t.length < MIN_SUMMARY_CHARS) throw new Error(`synthesis returned degenerate output (${t.length} chars)`);
+  if (looksLikeReasoning(t)) throw new Error(`synthesis opened with reasoning instead of the summary: ${t.slice(0, 80)}`);
   return t;
 }
 
