@@ -61,6 +61,8 @@ export interface ObservationRow {
   text: string;
   timestamp: number;
   source: string;
+  /** IANA timezone the user was in when this was recorded; null for notes from before timezones were stamped. */
+  tz?: string | null;
   /** Set on view rows only: this observation is already inside a tier-0 summary shown above (resolution ramp). */
   covered?: boolean;
 }
@@ -90,6 +92,7 @@ export interface ObservationMatch {
   timestamp: number;     // observation timestamp, or a summary's end timestamp
   score: number;         // lower = better (cosine distance blended with time penalty)
   kind: 'observation' | 'summary';
+  tz?: string | null;    // observations only: timezone at recording
   tier?: number;         // summaries only
   startTimestamp?: number; // summaries only
   obsCount?: number;     // summaries only: raw observations behind it, through all tiers
@@ -195,6 +198,8 @@ export class MemoryDO extends DurableObject<Env> {
     // summary through all tiers. NULL marks pre-migration rows for backfill.
     try { this.sql.exec('ALTER TABLE summaries ADD COLUMN obs_count INTEGER'); } catch { /* already present */ }
     try { this.sql.exec('ALTER TABLE summaries ADD COLUMN source_chars INTEGER'); } catch { /* already present */ }
+    // The user's timezone when each note was recorded, so dates read in local time even after a move.
+    try { this.sql.exec('ALTER TABLE observations ADD COLUMN tz TEXT'); } catch { /* already present */ }
     // Migration from the time-window pyramid (pre Aug 2026): a summary without
     // provenance rows is invalid in this design — nothing can be covered by it
     // and nothing can roll it up. Drop any such rows; the pyramid regrows
@@ -393,8 +398,8 @@ export class MemoryDO extends DurableObject<Env> {
     const timestamp = Date.now();
     const blob = embedding ? floatsToBlob(normalizeVec(embedding)) : null;
     this.sql.exec(
-      'INSERT INTO observations (id, text, timestamp, source, embedding) VALUES (?, ?, ?, ?, ?)',
-      id, text, timestamp, source, blob,
+      'INSERT INTO observations (id, text, timestamp, source, embedding, tz) VALUES (?, ?, ?, ?, ?, ?)',
+      id, text, timestamp, source, blob, this.getTimezone(),
     );
     for (const name of modelNames) {
       this.sql.exec(
@@ -464,9 +469,9 @@ export class MemoryDO extends DurableObject<Env> {
       return (1 - sim) * (1 - timeWeight) + computeTimePenalty(ts, now) * timeWeight;
     };
     const obs = this.sql
-      .exec('SELECT id, text, timestamp, embedding FROM observations WHERE embedding IS NOT NULL')
-      .toArray() as Array<{ id: string; text: string; timestamp: number; embedding: ArrayBuffer }>;
-    const scored: ObservationMatch[] = obs.map(r => ({ id: r.id, text: r.text, timestamp: r.timestamp, score: score(r.embedding, r.timestamp), kind: 'observation' as const }));
+      .exec('SELECT id, text, timestamp, tz, embedding FROM observations WHERE embedding IS NOT NULL')
+      .toArray() as Array<{ id: string; text: string; timestamp: number; tz: string | null; embedding: ArrayBuffer }>;
+    const scored: ObservationMatch[] = obs.map(r => ({ id: r.id, text: r.text, timestamp: r.timestamp, tz: r.tz, score: score(r.embedding, r.timestamp), kind: 'observation' as const }));
 
     if (includeSummaries) {
       // Arcs, not just receipts: summaries are searchable too. Recency uses the
@@ -499,7 +504,7 @@ export class MemoryDO extends DurableObject<Env> {
    */
   listObservationsForModel(modelId: string, limit = 200, afterTs = 0): ObservationRow[] {
     const rows = this.sql.exec(
-      `SELECT o.id, o.text, o.timestamp, o.source
+      `SELECT o.id, o.text, o.timestamp, o.source, o.tz
        FROM observations o
        JOIN observation_tags t ON t.observation_id = o.id
        WHERE t.model_id = ? AND o.timestamp > ?
@@ -551,7 +556,7 @@ export class MemoryDO extends DurableObject<Env> {
    */
   unsummarizedObservations(modelId: string, limit = 100_000): ObservationRow[] {
     const rows = this.sql.exec(
-      `SELECT o.id, o.text, o.timestamp, o.source
+      `SELECT o.id, o.text, o.timestamp, o.source, o.tz
        FROM observations o
        JOIN observation_tags t ON t.observation_id = o.id
        WHERE t.model_id = ?
@@ -615,7 +620,7 @@ export class MemoryDO extends DurableObject<Env> {
     const need = verbatim - tail.length;
     if (top >= 0 && need > 0) {
       const rows = this.sql.exec(
-        `SELECT o.id, o.text, o.timestamp, o.source
+        `SELECT o.id, o.text, o.timestamp, o.source, o.tz
          FROM observations o JOIN observation_tags t ON t.observation_id = o.id
          WHERE t.model_id = ?
            AND EXISTS (SELECT 1 FROM summary_sources ss JOIN summaries s ON s.id = ss.summary_id
@@ -753,7 +758,7 @@ export class MemoryDO extends DurableObject<Env> {
         }
         for (const children of groups) {
           if (calls >= maxCalls) return true;
-          const job = buildRollupJob(model, children);
+          const job = buildRollupJob(model, children, this.getTimezone());
           const text = checkSynthOutput(await this.runSynth(job)); calls++;
           await this.insertSummary(modelId, { tier: job.tier, text, startTimestamp: job.startTs, endTimestamp: job.endTs, sourceCount: children.length },
             job.sourceIds.map(id => ({ type: 'summary' as const, id })));
@@ -767,7 +772,7 @@ export class MemoryDO extends DurableObject<Env> {
     const { batches } = batchTier0(this.unsummarizedObservations(modelId));
     for (const batch of batches) {
       if (calls >= maxCalls) { result.remaining = true; return result; }
-      const job = buildTier0Job(model, batch);
+      const job = buildTier0Job(model, batch, this.getTimezone());
       const text = checkSynthOutput(await this.runSynth(job)); calls++;
       await this.insertSummary(modelId, { tier: 0, text, startTimestamp: job.startTs, endTimestamp: job.endTs, sourceCount: job.sourceIds.length },
         job.sourceIds.map(id => ({ type: 'observation' as const, id })));
@@ -852,7 +857,7 @@ export class MemoryDO extends DurableObject<Env> {
    */
   recentObservations(limit = 30): ObservationRow[] {
     const rows = this.sql.exec(
-      'SELECT id, text, timestamp, source FROM observations ORDER BY timestamp DESC, rowid DESC LIMIT ?',
+      'SELECT id, text, timestamp, source, tz FROM observations ORDER BY timestamp DESC, rowid DESC LIMIT ?',
       limit,
     ).toArray() as Array<Record<string, unknown>>;
     return rows.map(toObservationRow);
@@ -1037,6 +1042,17 @@ export class MemoryDO extends DurableObject<Env> {
    * embedding-space migration (old 1536-dim data can't be queried by 1024-dim
    * bge-m3 vectors, so it has to be cleared and re-seeded).
    */
+  // ---------- Timezone ----------
+
+  /** The user's current IANA timezone (UTC until set). New notes are stamped with it. */
+  getTimezone(): string {
+    return this.getConfig('timezone') ?? 'UTC';
+  }
+
+  setTimezone(tz: string): void {
+    this.setConfig('timezone', tz);
+  }
+
   // ---------- Self-portrait ----------
 
   /** The current self-portrait, or undefined before the agent has written one. */
@@ -1131,6 +1147,7 @@ function toObservationRow(r: Record<string, unknown>): ObservationRow {
     text: r.text as string,
     timestamp: r.timestamp as number,
     source: r.source as string,
+    tz: (r.tz as string | null | undefined) ?? null,
   };
 }
 

@@ -10,6 +10,7 @@
  * the DO runs the queries, calls synthesize(), and stores the results.
  * Spec: docs/pyramid-spec.md.
  */
+import { localRange, localStamp } from './time.js';
 import type { ObservationRow, ModelRow, SummaryRow } from './memory-do.js';
 
 /** A tier-0 batch closes at this many observations... */
@@ -37,11 +38,6 @@ export function ceilingTokensForTier(tier: number): number {
 }
 
 export function isoDate(ts: number): string { return new Date(ts).toISOString().slice(0, 10); }
-
-function rangeLabel(start: number, end: number): string {
-  const a = isoDate(start), b = isoDate(end);
-  return a === b ? a : `${a} – ${b}`;
-}
 
 // ---------- Batching ----------
 
@@ -83,7 +79,7 @@ const COMMON_RULES = `Rules that apply at every tier:
 - Write from this model's lens (its name and purpose are given). Observations are multi-tagged; other models carry their own angle on the same events. Surface what matters for THIS lens.
 - Preserve the load-bearing specifics — names, numbers, dates, decisions, turning points, the participants' own phrasing. They are what makes a memory verifiable later, and what later tiers will have to work from. Drop filler, drop repetition, keep the facts.
 - Trace the arc with causal connective tissue: what developed, what shifted because of what, what is still open. Narrative, not a flat list.
-- Dates: write arcs as date ranges (e.g. "between Jun 6 and Jun 16") and discrete events as dates (e.g. "on Apr 17"). A window that falls on a single day is "on Jun 6", never "between Jun 6 and Jun 6". Dates should read as part of the narrative, not as labels.
+- Dates: when you keep an event, keep its date with it ("on Apr 17"), and give arcs ranges ("between Jun 6 and Jun 16"). Compress by dropping lesser events rather than blurring the dates of the ones you keep into a wider range; a later reader relies on these dates to place things in time. The window's own range is already on the summary's label, so the prose needn't open with it. Include the year when the window spans two.
 - Factual discipline: never invent a number, name, date, or relationship that is not in the material. An omission is correct; a confabulation corrupts everything built on top of this.
 - Hold to the target length. Use it fully when the material is rich - ten substantive observations deserve the whole budget, and leaving specifics out to come in short is a loss, not a virtue. Shorter is fine only when the material is genuinely thin.
 - Prefer concrete events, decisions, numbers, and names over characterizations. "Decided on May 10 to sell the house" beats "navigated major life decisions"; "closed Cristi at $4K/mo + 10%" beats "made progress on partnerships". At higher tiers this matters most: compress by dropping lesser events, not by turning events into adjectives.
@@ -113,15 +109,15 @@ export interface SynthJob {
   sourceIds: string[];     // observation ids (tier0) or summary ids (rollup)
 }
 
-export function buildTier0Job(model: ModelRow, batch: ObservationRow[]): SynthJob {
+export function buildTier0Job(model: ModelRow, batch: ObservationRow[], tz = 'UTC'): SynthJob {
   const sorted = [...batch].sort((a, b) => a.timestamp - b.timestamp);
   const startTs = sorted[0]!.timestamp;
   const endTs = sorted[sorted.length - 1]!.timestamp;
   const target = targetCharsForTier(0);
-  const body = sorted.map(o => `- [${isoDate(o.timestamp)}] ${o.text}`).join('\n');
+  const body = sorted.map(o => `- [${localStamp(o.timestamp, o.tz ?? tz)}] ${o.text}`).join('\n');
   const user = `Model: ${model.name}
 Purpose: ${model.description ?? model.name}
-Window: ${rangeLabel(startTs, endTs)} (${sorted.length} observations)
+Window: ${localRange(startTs, endTs, tz)} (${sorted.length} observations)
 
 Observations, oldest first:
 ${body}
@@ -130,17 +126,17 @@ Write a ~${target}-character tier-0 summary of this window through the "${model.
   return { kind: 'tier0', tier: 0, system: TIER0_SYSTEM, user, maxTokens: ceilingTokensForTier(0), targetChars: target, startTs, endTs, sourceIds: sorted.map(o => o.id) };
 }
 
-export function buildRollupJob(model: ModelRow, children: SummaryRow[]): SynthJob {
+export function buildRollupJob(model: ModelRow, children: SummaryRow[], tz = 'UTC'): SynthJob {
   const sorted = [...children].sort((a, b) => a.startTimestamp - b.startTimestamp);
   const childTier = sorted[0]!.tier;
   const tier = childTier + 1;
   const startTs = Math.min(...sorted.map(s => s.startTimestamp));
   const endTs = Math.max(...sorted.map(s => s.endTimestamp));
   const target = targetCharsForTier(tier);
-  const body = sorted.map(s => `[${rangeLabel(s.startTimestamp, s.endTimestamp)} · tier ${s.tier} · ${s.sourceCount} sources]\n${s.text}`).join('\n\n---\n\n');
+  const body = sorted.map(s => `[${localRange(s.startTimestamp, s.endTimestamp, tz)} · tier ${s.tier} · ${s.sourceCount} sources]\n${s.text}`).join('\n\n---\n\n');
   const user = `Model: ${model.name}
 Purpose: ${model.description ?? model.name}
-Window: ${rangeLabel(startTs, endTs)} (${sorted.length} tier-${childTier} summaries)
+Window: ${localRange(startTs, endTs, tz)} (${sorted.length} tier-${childTier} summaries)
 
 Summaries to compress, oldest first:
 ${body}
@@ -157,7 +153,7 @@ Write a ~${target}-character tier-${tier} summary of this window through the "${
  */
 export function stubSynthesize(job: SynthJob): string {
   const heads = job.user.split('\n').filter(l => l.startsWith('- [') || l.startsWith('[')).map(l => l.slice(0, 60));
-  return `[stub ${job.kind} tier ${job.tier} · ${job.sourceIds.length} sources · ${rangeLabel(job.startTs, job.endTs)}] ${heads.join(' | ')}`.slice(0, job.targetChars);
+  return `[stub ${job.kind} tier ${job.tier} · ${job.sourceIds.length} sources · ${localRange(job.startTs, job.endTs)}] ${heads.join(' | ')}`.slice(0, job.targetChars);
 }
 
 // ---------- Rendering ----------

@@ -30,7 +30,7 @@ The same primitives as Glopus memory, minus the parts that required owning the c
 
 ```
 models            id, name, description, is_seed, archived, created_at, last_summarized_count (unused, kept)
-observations      id, text, timestamp, source, embedding
+observations      id, text, timestamp, source, embedding, tz
 observation_tags  observation_id, model_id
 summaries         id, model_id, tier, text, start_timestamp, end_timestamp, source_count, is_dirty (unused), embedding
 summary_sources   summary_id, source_type ('observation' | 'summary'), source_id
@@ -38,6 +38,7 @@ config            key, value
 ```
 
 - An **observation** is a short agent-authored note, tagged to one or more models. Observations are never edited or deleted by the system.[^dirty]
+- **Time.** Timestamps are stored in UTC. Each observation also stores `tz`, the IANA timezone the user was in when it was recorded (the memory's current timezone, `config.timezone`, set with `set_timezone`; UTC until set). Every label, in summary prompts and in views, is rendered in local time: a note in its own zone, a summary window in the current one. Notes from before stamping fall back to the current zone. A note written at 00:30 in Skopje reads as that day, and a note written in Vancouver keeps Vancouver time after a move.
 - A **model** is a mental model - a person, project, topic, or facet. Five seed models (`self`, `user`, `system`, `world`, `memory`) are protected from archive and rename.
 - A **summary** is one node of a model's pyramid. `tier` is **depth**: 0 = built from observations, 1 = built from tier-0 summaries, and so on.[^tiername] `summary_sources` records exactly which observations (tier 0) or summaries (tier N+1) it was built from. A summary without sources is invalid and is deleted on DO start.[^legacy]
 
@@ -107,7 +108,7 @@ Loading is a deliberate two-step protocol, and the agent **is** the router: it h
 
 **`load_memory` (no arguments)** returns the map, never the memories:
 
-1. **Model index** - every active model with its description, its note count and the date of its newest note (`[12 obs · last 2026-07-14, 4mo ago]`, or `[no notes yet]`). Descriptions are written once and drift; the date makes a stale one ("active", last note four months ago) visible without loading the model.
+1. **Model index** - every active model with its description, its note count and the date of its newest note (`[12 obs · last 2026-07-14]`, or `[no notes yet]`). Descriptions are written once and drift; the date makes a stale one ("active", last note four months ago) visible without loading the model.
 2. **Recent notes** - the newest observations across all models, verbatim, newest first, capped by characters, whether or not a pyramid has covered them. The cross-conversation continuity substitute.[^stream][^recent]
 
 The response ends by saying so in-band: nothing is loaded yet - pick the relevant models and call `load_model`. That visible incompleteness is the mechanism: an index alone is a menu, and a menu demands a pick.

@@ -4,12 +4,10 @@
  * carry the confidence-tier convention the `instructions` field explains.
  */
 import type { ModelRow, ObservationRow, SummaryRow, ObservationMatch } from './memory-do.js';
+import { localDate, localStamp } from './time.js';
 
 const DAY_MS = 86_400_000;
 
-function isoDate(ts: number): string {
-  return new Date(ts).toISOString().slice(0, 10);
-}
 
 /** Compact char counts for compression labels: 612, 1.0K, 61K. */
 function fmtChars(n: number): string {
@@ -27,9 +25,10 @@ export function formatConfidenceMeta(
   name: string,
   conf: { obsCount: number; earliest: number | null; latest: number | null },
   now: number = Date.now(),
+  tz = 'UTC',
 ): string {
   if (conf.obsCount === 0 || conf.latest === null || conf.earliest === null) return `[${name} · 0 obs]`;
-  const latestDate = isoDate(conf.latest);
+  const latestDate = localDate(conf.latest, tz);
   const daysSinceLatest = Math.floor((now - conf.latest) / DAY_MS);
   const spanDays = Math.floor((conf.latest - conf.earliest) / DAY_MS);
   const spanLabel = spanDays >= 60 ? `${Math.round(spanDays / 30)}mo` : spanDays >= 2 ? `${spanDays}d` : 'today';
@@ -38,32 +37,33 @@ export function formatConfidenceMeta(
 }
 
 /** Label for a match: observations by date, summaries by range and tier. */
-function matchLabel(m: ObservationMatch): string {
+function matchLabel(m: ObservationMatch, tz: string): string {
   if (m.kind === 'summary') {
     const start = m.startTimestamp ?? m.timestamp;
-    const range = isoDate(start) === isoDate(m.timestamp) ? isoDate(m.timestamp) : `${isoDate(start)}–${isoDate(m.timestamp)}`;
+    const a = localDate(start, tz), b = localDate(m.timestamp, tz);
+    const range = a === b ? b : `${a}–${b}`;
     const backing = m.obsCount ? ` · ${m.obsCount} obs` : '';
     return `[${range} · summary tier ${m.tier ?? 0}${backing}]`;
   }
-  return `[${isoDate(m.timestamp)}]`;
+  return `[${localDate(m.timestamp, m.tz ?? tz)}]`;
 }
 
 /** Raw recall results — numbered, dated, best first. Observations are receipts, summaries are arcs. Agent synthesizes. */
-export function formatRecall(matches: ObservationMatch[]): string {
+export function formatRecall(matches: ObservationMatch[], tz = 'UTC'): string {
   if (matches.length === 0) return 'No relevant memories found.';
-  return matches.map((m, i) => `[${i + 1}] ${matchLabel(m)} ${m.text}`).join('\n\n');
+  return matches.map((m, i) => `[${i + 1}] ${matchLabel(m, tz)} ${m.text}`).join('\n\n');
 }
 
 /**
  * Recency-first recent notes — the short-term continuity substitute. Caps by
  * character budget so a busy stretch can't blow the context window.
  */
-export function formatRecentNotes(obs: ObservationRow[], capChars = 6000): string {
+export function formatRecentNotes(obs: ObservationRow[], capChars = 6000, tz = 'UTC'): string {
   if (obs.length === 0) return '';
   const lines: string[] = [];
   let used = 0;
   for (const o of obs) {
-    const line = `- [${isoDate(o.timestamp)}] ${o.text}`;
+    const line = `- [${localStamp(o.timestamp, o.tz ?? tz)}] ${o.text}`;
     if (used + line.length > capChars && lines.length > 0) break;
     lines.push(line);
     used += line.length + 1;
@@ -87,10 +87,11 @@ export function formatModelView(
   summaries: SummaryRow[],
   recentObs: ObservationRow[],
   now: number = Date.now(),
+  tz = 'UTC',
 ): string {
   const parts: string[] = [];
   parts.push(`## ${model.name} — ${model.description ?? ''}`.trimEnd());
-  parts.push(formatConfidenceMeta(model.name, conf, now));
+  parts.push(formatConfidenceMeta(model.name, conf, now, tz));
   // Chronological by start (ties: higher tier first), then recent verbatim notes.
   // Ramp rows (already covered by a tile above) say so, so the overlap is explicit.
   // Label carries the TRANSITIVE backing (raw observations and their chars,
@@ -99,23 +100,14 @@ export function formatModelView(
   // fan-in); what calibrates confidence is how much was compressed away.
   for (const s of [...summaries].sort((a, b) => a.startTimestamp - b.startTimestamp || b.tier - a.tier)) {
     const covered = s.covered ? ' · finer view of a period summarized above' : '';
-    parts.push(`\n[tier ${s.tier} · ${s.obsCount} obs · ${fmtChars(s.sourceChars)}→${fmtChars(s.text.length)} chars · ${isoDate(s.startTimestamp)}–${isoDate(s.endTimestamp)}${covered}]\n${s.text}`);
+    parts.push(`\n[tier ${s.tier} · ${s.obsCount} obs · ${fmtChars(s.sourceChars)}→${fmtChars(s.text.length)} chars · ${localDate(s.startTimestamp, tz)}–${localDate(s.endTimestamp, tz)}${covered}]\n${s.text}`);
   }
   if (recentObs.length > 0) {
     const ordered = [...recentObs].sort((a, b) => a.timestamp - b.timestamp); // oldest→newest
     parts.push('\nRecent notes (verbatim):');
-    for (const o of ordered) parts.push(`- [${isoDate(o.timestamp)}${o.covered ? ' · also summarized above' : ''}] ${o.text}`);
+    for (const o of ordered) parts.push(`- [${localStamp(o.timestamp, o.tz ?? tz)}${o.covered ? ' · also summarized above' : ''}] ${o.text}`);
   }
   return parts.join('\n');
-}
-
-/** "today", "yesterday", "12d ago", "4mo ago" — how long since a timestamp. */
-export function ago(ts: number, now: number = Date.now()): string {
-  const days = Math.floor((now - ts) / DAY_MS);
-  if (days <= 0) return 'today';
-  if (days === 1) return 'yesterday';
-  if (days < 60) return `${days}d ago`;
-  return `${Math.round(days / 30)}mo ago`;
 }
 
 /**
@@ -126,7 +118,7 @@ export function ago(ts: number, now: number = Date.now()): string {
 export function formatModelIndex(
   models: ModelRow[],
   activity?: Map<string, { obsCount: number; latest: number | null }>,
-  now: number = Date.now(),
+  tz = 'UTC',
 ): string {
   if (models.length === 0) return '';
   const sorted = [...models].sort((a, b) => a.name.localeCompare(b.name));
@@ -134,7 +126,7 @@ export function formatModelIndex(
     if (!activity) return '';
     const a = activity.get(m.id);
     if (!a || a.obsCount === 0 || a.latest === null) return ' [no notes yet]';
-    return ` [${a.obsCount} obs · last ${isoDate(a.latest)}, ${ago(a.latest, now)}]`;
+    return ` [${a.obsCount} obs · last ${localDate(a.latest, tz)}]`;
   };
   const lines = sorted.map(m => `- ${m.name}: ${m.description ?? ''}`.trimEnd() + meta(m));
   const legend = activity

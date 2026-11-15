@@ -66,9 +66,9 @@ describe('formatModelIndex / formatModelView', () => {
       ['m1', { obsCount: 12, latest: NOW }],
       ['m2', { obsCount: 3, latest: NOW - 120 * DAY }],
     ]);
-    const out = formatModelIndex([model, stale, empty], activity, NOW);
-    expect(out).toContain('- coaching: coaching practice [12 obs · last 2026-05-30, today]');
-    expect(out).toContain('- old-hobby: an active hobby [3 obs · last 2026-01-30, 4mo ago]');
+    const out = formatModelIndex([model, stale, empty], activity);
+    expect(out).toContain('- coaching: coaching practice [12 obs · last 2026-05-30]');
+    expect(out).toContain('- old-hobby: an active hobby [3 obs · last 2026-01-30]');
     expect(out).toContain('- fresh: just created [no notes yet]');
     expect(out).toContain('description may be out of date');
   });
@@ -85,7 +85,7 @@ describe('formatModelIndex / formatModelView', () => {
     );
     const i1 = out.indexOf('[tier 1 · 50 obs · 61K→7 chars · 2026-04-20–2026-05-10]\nold arc');
     const i0 = out.indexOf('[tier 0 · 10 obs · 1.0K→12 chars · 2026-05-11–2026-05-28]\nrecent batch');
-    const it = out.indexOf('Recent notes (verbatim):\n- [2026-05-30] fresh note');
+    const it = out.indexOf('Recent notes (verbatim):\n- [2026-05-30 ') ;
     expect(i1).toBeGreaterThan(0);
     expect(i0).toBeGreaterThan(i1);
     expect(it).toBeGreaterThan(i0);

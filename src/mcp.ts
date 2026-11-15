@@ -9,6 +9,7 @@
  * `env.AI` binding (Workers AI bge-m3) — no per-user key, nothing to forward.
  */
 import { normName, type MemoryDO } from './memory-do.js';
+import { isValidTimeZone, localDate, localStamp } from './time.js';
 import { formatRecall, formatRecentNotes, formatModelView, formatModelIndex } from './format.js';
 import { renderWithBudget } from './pyramid.js';
 
@@ -96,8 +97,9 @@ function formatPortrait(memory: MemoryDO): string {
   if (!current) {
     return '# Your self-portrait\n_You haven\'t written one yet. When you have a moment: load_model("self"), recall what you need, and write it with edit_self (empty old_text). First person, who you are rather than what happened._';
   }
-  const edits = versions.slice(0, PORTRAIT_RECENT_EDITS).map(v => `- [${day(v.createdAt)}] ${v.why}`).join('\n');
-  return `# Your self-portrait\n_Written and edited only by you (edit_self). Version ${current.id}, last edited ${day(current.createdAt)}._\n\n${current.text}\n\nRecent edits:\n${edits}`;
+  const tz = memory.getTimezone();
+  const edits = versions.slice(0, PORTRAIT_RECENT_EDITS).map(v => `- [${localDate(v.createdAt, tz)}] ${v.why}`).join('\n');
+  return `# Your self-portrait\n_Written and edited only by you (edit_self). Version ${current.id}, last edited ${localDate(current.createdAt, tz)}._\n\n${current.text}\n\nRecent edits:\n${edits}`;
 }
 
 interface ToolDef {
@@ -165,6 +167,23 @@ const TOOLS: ToolDef[] = [
         out += `\n\n[memory note: ${frag.underPopulated} sparse models out of ${frag.activeModels} active — consider folding related ones (fold) or archiving stale ones (archive_model).]`;
       }
       return out;
+    },
+  },
+  {
+    name: 'set_timezone',
+    description:
+      'Set the user\'s current timezone (an IANA name like "Europe/Skopje" or "America/Vancouver"). Dates and times in memory are shown in it, and every note recorded from now on is stamped with it, so notes keep their local dates after a move. Call it when the user tells you they have moved or are travelling, or when their local time plainly differs from the timezone load_memory reports.',
+    inputSchema: {
+      type: 'object',
+      properties: { timezone: { type: 'string', description: 'IANA timezone name, e.g. "Asia/Jerusalem".' } },
+      required: ['timezone'],
+    },
+    handler: async (memory, args) => {
+      const tz = String(args.timezone ?? '').trim();
+      if (!tz || !isValidTimeZone(tz)) return badArgsError(args, 'Pass "timezone": an IANA name like "Europe/Skopje".');
+      const before = memory.getTimezone();
+      memory.setTimezone(tz);
+      return before === tz ? `Timezone is already ${tz}.` : `Timezone set to ${tz} (was ${before}). It is ${localStamp(Date.now(), tz)} there.`;
     },
   },
   {
@@ -322,7 +341,7 @@ const TOOLS: ToolDef[] = [
       let qv: number[];
       try { qv = await memory.embed(query); }
       catch (e) { console.error('[recall] embed failed:', e); return 'Recall is temporarily unavailable (embedding error). Try again shortly.'; }
-      return formatRecall(memory.searchObservations(qv, RECALL_LIMIT, 0.3));
+      return formatRecall(memory.searchObservations(qv, RECALL_LIMIT, 0.3), memory.getTimezone());
     },
   },
   {
@@ -331,10 +350,11 @@ const TOOLS: ToolDef[] = [
       'The entry point to memory — call at the start of every conversation, before anything else. Returns the model index (every mental model with its description) and recent notes (continuity across conversations). It loads no memories by itself: read the index, pick every model relevant to the conversation, and call load_model once per model (in parallel is fine). Loading memory always takes both steps.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (memory) => {
-      const blocks: string[] = [formatPortrait(memory), formatModelIndex(memory.listModels(), memory.modelActivity())];
-      const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT));
+      const tz = memory.getTimezone();
+      const blocks: string[] = [formatPortrait(memory), formatModelIndex(memory.listModels(), memory.modelActivity(), tz)];
+      const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT), 6000, tz);
       if (recent) blocks.push(`# Recent notes\n_Newest first — continuity across recent conversations._\n\n${recent}`);
-      blocks.push('_This is the map, not the memory — nothing is loaded yet. Pick every model relevant to this conversation and call `load_model` for each one (parallel calls are fine)._');
+      blocks.push(`_Dates and times are local to the user, currently ${tz} (it is ${localStamp(Date.now(), tz)} there); call set_timezone if they've moved. This is the map, not the memory — nothing is loaded yet. Pick every model relevant to this conversation and call \`load_model\` for each one (parallel calls are fine)._`);
       return blocks.filter(Boolean).join('\n\n');
     },
   },
@@ -374,7 +394,7 @@ const TOOLS: ToolDef[] = [
       // or rollups in the background (bounded; a no-op when nothing's pending).
       memory.background(memory.maybeResummarize([model.name]));
       const portrait = model.name === 'self' ? `${formatPortrait(memory)}\n\n` : '';
-      return `${portrait}# Loaded model\n\n${formatModelView(model, conf, view.summaries, view.observations)}`;
+      return `${portrait}# Loaded model\n\n${formatModelView(model, conf, view.summaries, view.observations, Date.now(), memory.getTimezone())}`;
     },
   },
   {

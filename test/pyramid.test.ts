@@ -67,7 +67,7 @@ describe('prompts', () => {
     expect(job.user).toContain('first call');
     expect(job.user).toContain('signed the deal');
     expect(job.user).toContain(`~${targetCharsForTier(0)}-character`);
-    expect(job.system).toContain('date ranges');
+    expect(job.system).toContain('keep its date');
     expect(job.system).toContain('never invent');
     expect(job.sourceIds).toEqual(batch.map(o => o.id));
     expect(job.startTs).toBeLessThan(job.endTs);
