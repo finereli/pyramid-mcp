@@ -33,6 +33,14 @@ export const SEED_MODELS: ReadonlyArray<{ name: string; description: string }> =
 
 export const PROTECTED_SEED_NAMES: ReadonlySet<string> = new Set(SEED_MODELS.map(m => m.name));
 
+/**
+ * Models the agent writes about itself, so no outside summarizer compresses
+ * them: their notes stay raw and the agent keeps a self-portrait instead.
+ */
+export const AGENT_WRITTEN_MODELS: ReadonlySet<string> = new Set(['self']);
+
+export interface PortraitVersion { id: number; text: string; why: string; createdAt: number }
+
 export function isProtectedSeed(name: string): boolean {
   return PROTECTED_SEED_NAMES.has(name);
 }
@@ -172,6 +180,13 @@ export class MemoryDO extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS idx_ss_source ON summary_sources(source_type, source_id);
       CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
+      -- The agent's self-portrait: every version kept, newest is current. Only the agent writes it (edit_self).
+      CREATE TABLE IF NOT EXISTS self_portrait (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        text       TEXT NOT NULL,
+        why        TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
     `);
     // Add columns introduced after the initial schema, for DOs created earlier.
     try { this.sql.exec('ALTER TABLE models ADD COLUMN last_summarized_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already present */ }
@@ -710,7 +725,7 @@ export class MemoryDO extends DurableObject<Env> {
     const maxCalls = opts.maxCalls ?? Number.POSITIVE_INFINITY;
     const result: AdvanceResult = { tier0: 0, rollups: 0, remaining: false };
     const model = this.getModelById(modelId);
-    if (!model) return result;
+    if (!model || AGENT_WRITTEN_MODELS.has(model.name)) return result;
     let calls = 0;
 
     // Roll up every tier that has a full batch, climbing. Returns true if the
@@ -1008,6 +1023,26 @@ export class MemoryDO extends DurableObject<Env> {
    * embedding-space migration (old 1536-dim data can't be queried by 1024-dim
    * bge-m3 vectors, so it has to be cleared and re-seeded).
    */
+  // ---------- Self-portrait ----------
+
+  /** The current self-portrait, or undefined before the agent has written one. */
+  getSelfPortrait(): PortraitVersion | undefined {
+    return this.listPortraitVersions(1)[0];
+  }
+
+  /** Portrait versions, newest first. */
+  listPortraitVersions(limit: number): PortraitVersion[] {
+    return (this.sql.exec('SELECT id, text, why, created_at FROM self_portrait ORDER BY id DESC LIMIT ?', limit)
+      .toArray() as Array<{ id: number; text: string; why: string; created_at: number }>)
+      .map(r => ({ id: r.id, text: r.text, why: r.why, createdAt: r.created_at }));
+  }
+
+  /** Store a new version as the current portrait. */
+  saveSelfPortrait(text: string, why: string): number {
+    const row = this.sql.exec('INSERT INTO self_portrait (text, why, created_at) VALUES (?, ?, ?) RETURNING id', text, why, Date.now()).one() as { id: number };
+    return row.id;
+  }
+
   resetMemory(): { cleared: true } {
     this.sql.exec('DELETE FROM observation_tags');
     this.sql.exec('DELETE FROM observations');
@@ -1015,6 +1050,7 @@ export class MemoryDO extends DurableObject<Env> {
     this.sql.exec('DELETE FROM summaries');
     this.sql.exec('DELETE FROM models');
     this.sql.exec('DELETE FROM config');
+    this.sql.exec('DELETE FROM self_portrait');
     this.ensureSeedModels();
     return { cleared: true };
   }

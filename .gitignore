@@ -14,3 +14,4 @@ seed-data/
 eval-report.md
 scripts/synth-ab-report.md
 scripts/*-report.md
+backups/

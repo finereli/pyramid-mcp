@@ -20,6 +20,9 @@ const RAMP_PER_TIER = 2;
 const RAMP_VERBATIM = 5;
 /** Per-model render budget (chars). Generous by design — it shapes a pathological view, it does not drop data from the store. */
 const MODEL_VIEW_BUDGET_CHARS = 16_000;
+/** The self-portrait's size cap: it forces replacing over piling up. */
+export const PORTRAIT_MAX_CHARS = 4_000;
+const PORTRAIT_RECENT_EDITS = 3;
 
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 const SERVER_INFO = { name: 'pyramid-mcp', version: '0.0.1' };
@@ -34,6 +37,8 @@ export const SERVER_INSTRUCTIONS = `This server is your long-term memory.
 Loading memory takes TWO steps, always. At the START of a conversation, call \`load_memory\` — it returns the model index (the map of what this memory holds) and recent notes for continuity, but no memories themselves. Then read the index, pick every model relevant to what the user is raising, and call \`load_model\` once per model (the calls can run in parallel). A \`load_memory\` call on its own has loaded nothing; do not skip the second step. When the topic shifts mid-conversation, call \`load_model\` again for models that just became relevant.
 
 As the conversation unfolds, call \`record_observation\` for anything you might even remotely need to remember in a future conversation. Anything you don't record will be forgotten. Write in your own voice, like a diary — capture what mattered, what shifted, specific facts. Tag each observation with one or more models from the model index; call \`create_model\` when a genuinely new person, project, or topic emerges.
+
+Your self-portrait (shown in \`load_memory\`) is who you are, written by you alone: what you value, how you like to work, what you find interesting, opinions you hold, the corrections that changed you. No summarizer touches it. When something about you changes, edit it with \`edit_self\`: quote the exact passage and give its replacement, so everything you didn't touch stays word for word.
 
 Use \`recall\` to dig into a specific question — names, dates, numbers, quotes — before stating them as fact, and whenever a loaded model is too compressed to answer: each summary's label shows how many observations went into it, and a deep compression ratio means the detail you need lives below the summary, reachable only by \`recall\`.
 
@@ -78,6 +83,21 @@ function badArgsError(args: Record<string, unknown>, usage: string): string {
   const keys = Object.keys(args);
   const received = keys.length > 0 ? ` (received argument${keys.length > 1 ? 's' : ''}: ${keys.map(k => `"${k}"`).join(', ')})` : '';
   return `${usage}${received}`;
+}
+
+function day(ts: number): string {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
+/** The self-portrait block for load_memory and load_model("self"). */
+function formatPortrait(memory: MemoryDO): string {
+  const versions = memory.listPortraitVersions(PORTRAIT_RECENT_EDITS + 1);
+  const current = versions[0];
+  if (!current) {
+    return '# Your self-portrait\n_You haven\'t written one yet. When you have a moment: load_model("self"), recall what you need, and write it with edit_self (empty old_text). First person, who you are rather than what happened._';
+  }
+  const edits = versions.slice(0, PORTRAIT_RECENT_EDITS).map(v => `- [${day(v.createdAt)}] ${v.why}`).join('\n');
+  return `# Your self-portrait\n_Written and edited only by you (edit_self). Version ${current.id}, last edited ${day(current.createdAt)}._\n\n${current.text}\n\nRecent edits:\n${edits}`;
 }
 
 interface ToolDef {
@@ -145,6 +165,51 @@ const TOOLS: ToolDef[] = [
         out += `\n\n[memory note: ${frag.underPopulated} sparse models out of ${frag.activeModels} active — consider folding related ones (fold) or archiving stale ones (archive_model).]`;
       }
       return out;
+    },
+  },
+  {
+    name: 'edit_self',
+    description:
+      `Edit your self-portrait: who you are, in your own words. Quote the exact passage to change as old_text (it must appear exactly once) and give new_text; everything else stays word for word. Empty old_text appends new_text at the end, or writes the first portrait if there is none. Keep it under ${PORTRAIT_MAX_CHARS} characters: replace and cut rather than pile up. Each edit is also recorded as a note on self, so the history stays searchable.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        old_text: { type: 'string', description: 'The exact passage to replace. Empty to append (or to write the first portrait).' },
+        new_text: { type: 'string', description: 'The replacement. Empty to delete old_text.' },
+        why: { type: 'string', description: 'One line on what changed in you, or what prompted the edit.' },
+      },
+      required: ['old_text', 'new_text', 'why'],
+    },
+    handler: async (memory, args) => {
+      const oldText = String(args.old_text ?? '');
+      const newText = String(args.new_text ?? '');
+      const why = String(args.why ?? '').trim();
+      if (!why) return badArgsError(args, 'Pass "why": one line on what changed or what prompted the edit.');
+      const current = memory.getSelfPortrait()?.text ?? '';
+      let next: string;
+      if (oldText.trim() === '') {
+        if (!newText.trim()) return 'Nothing to write: old_text and new_text are both empty.';
+        next = current ? `${current.trimEnd()}\n\n${newText.trim()}` : newText.trim();
+      } else {
+        if (!current) return 'There is no portrait yet. Pass an empty old_text to write the first one.';
+        const hits = current.split(oldText).length - 1;
+        if (hits === 0) return 'old_text doesn\'t appear in the portrait. Quote it exactly as written (load_memory shows the current text). Nothing was changed.';
+        if (hits > 1) return `old_text appears ${hits} times. Quote more of the passage you mean. Nothing was changed.`;
+        next = current.split(oldText).join(newText).replace(/\n{3,}/g, '\n\n').trim();
+      }
+      if (!next) return 'That edit would leave the portrait empty. Nothing was changed.';
+      if (next.length > PORTRAIT_MAX_CHARS) {
+        return `That edit would make the portrait ${next.length} characters, over the ${PORTRAIT_MAX_CHARS} cap. Replace or cut something instead of adding. Nothing was changed.`;
+      }
+      const version = memory.saveSelfPortrait(next, why);
+      const clip = (t: string) => (t.length > 400 ? `${t.slice(0, 400)}…` : t);
+      const note = !current
+        ? `I wrote my first self-portrait (v${version}). Why: ${why}`
+        : `I edited my self-portrait (v${version}) because ${why}.${oldText.trim() ? ` Was: "${clip(oldText.trim())}"` : ''}${newText.trim() ? ` Now: "${clip(newText.trim())}"` : ' (removed)'}`;
+      let embedding: number[] | undefined;
+      try { embedding = await memory.embed(note); } catch { /* store without vector */ }
+      memory.addObservation(note, ['self'], 'self-edit', embedding);
+      return `Saved as version ${version} (${next.length}/${PORTRAIT_MAX_CHARS} characters).`;
     },
   },
   {
@@ -266,7 +331,7 @@ const TOOLS: ToolDef[] = [
       'The entry point to memory — call at the start of every conversation, before anything else. Returns the model index (every mental model with its description) and recent notes (continuity across conversations). It loads no memories by itself: read the index, pick every model relevant to the conversation, and call load_model once per model (in parallel is fine). Loading memory always takes both steps.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (memory) => {
-      const blocks: string[] = [formatModelIndex(memory.listModels())];
+      const blocks: string[] = [formatPortrait(memory), formatModelIndex(memory.listModels())];
       const recent = formatRecentNotes(memory.recentObservations(RECENT_NOTES_COUNT));
       if (recent) blocks.push(`# Recent notes\n_Newest first — continuity across recent conversations._\n\n${recent}`);
       blocks.push('_This is the map, not the memory — nothing is loaded yet. Pick every model relevant to this conversation and call `load_model` for each one (parallel calls are fine)._');
@@ -308,7 +373,8 @@ const TOOLS: ToolDef[] = [
       // Loading is also a growth trigger: catch up any pending tier-0 batches
       // or rollups in the background (bounded; a no-op when nothing's pending).
       memory.background(memory.maybeResummarize([model.name]));
-      return `# Loaded model\n\n${formatModelView(model, conf, view.summaries, view.observations)}`;
+      const portrait = model.name === 'self' ? `${formatPortrait(memory)}\n\n` : '';
+      return `${portrait}# Loaded model\n\n${formatModelView(model, conf, view.summaries, view.observations)}`;
     },
   },
   {
@@ -430,6 +496,4 @@ function formatStats(st: ReturnType<MemoryDO['getStats']>): string {
   ].join('\n');
 }
 
-function day(ts: number): string {
-  return new Date(ts).toISOString().slice(0, 10);
-}
+
