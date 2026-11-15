@@ -59,6 +59,19 @@ describe('formatModelIndex / formatModelView', () => {
     expect(out).toContain('# Model index');
     expect(out).toContain('- coaching: coaching practice');
   });
+  it('shows note count and last-updated date per model when given activity', () => {
+    const stale: ModelRow = { ...model, id: 'm2', name: 'old-hobby', description: 'an active hobby' };
+    const empty: ModelRow = { ...model, id: 'm3', name: 'fresh', description: 'just created' };
+    const activity = new Map([
+      ['m1', { obsCount: 12, latest: NOW }],
+      ['m2', { obsCount: 3, latest: NOW - 120 * DAY }],
+    ]);
+    const out = formatModelIndex([model, stale, empty], activity, NOW);
+    expect(out).toContain('- coaching: coaching practice [12 obs · last 2026-05-30, today]');
+    expect(out).toContain('- old-hobby: an active hobby [3 obs · last 2026-01-30, 4mo ago]');
+    expect(out).toContain('- fresh: just created [no notes yet]');
+    expect(out).toContain('description may be out of date');
+  });
   it('renders the cover oldest-first with tier labels, then the tail', () => {
     const out = formatModelView(
       model,
